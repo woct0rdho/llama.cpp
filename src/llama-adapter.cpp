@@ -207,7 +207,7 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
         auto general_arch_str = get_kv_str(llm_kv(LLM_KV_GENERAL_ARCHITECTURE));
         auto general_arch = llm_arch_from_string(general_arch_str);
         if (general_arch != model.arch) {
-            throw std::runtime_error("model arch and LoRA arch mismatch");
+            // throw std::runtime_error("model arch and LoRA arch mismatch");
         }
 
         auto adapter_type = get_kv_str(llm_kv(LLM_KV_ADAPTER_TYPE));
