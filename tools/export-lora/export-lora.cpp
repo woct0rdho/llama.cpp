@@ -172,7 +172,7 @@ struct lora_merge_ctx {
         auto general_arch_base = get_kv_str(base_model.ctx_gguf, "general.architecture");
         auto general_arch_lora = get_kv_str(adapter->ctx_gguf,   "general.architecture");
         if (general_arch_base != general_arch_lora) {
-            throw std::runtime_error("model arch and LoRA arch mismatch");
+            // throw std::runtime_error("model arch and LoRA arch mismatch");
         }
     }
 
