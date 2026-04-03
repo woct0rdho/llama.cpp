@@ -168,6 +168,8 @@ struct quantize_state_impl {
     const llama_model                 & model;
     const llama_model_quantize_params * params;
 
+    bool is_adapter = false;
+
     int n_attention_wv = 0;
     int n_ffn_down     = 0;
     int n_ffn_gate     = 0;
@@ -294,7 +296,10 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     const std::string name = ggml_get_name(tensor);
 
     // This used to be a regex, but <regex> has an extreme cost to compile times.
-    bool quantize = name.rfind("weight") == name.size() - 6; // ends with 'weight'?
+    const bool is_weight = name.size() >= 6 && name.rfind("weight") == name.size() - 6;
+    const bool is_lora   = (name.size() >= 7 && name.rfind(".lora_a") == name.size() - 7) ||
+                           (name.size() >= 7 && name.rfind(".lora_b") == name.size() - 7);
+    bool quantize = is_weight || is_lora;
 
     // do not quantize norm tensors
     quantize &= name.find("_norm.weight") == std::string::npos;
@@ -315,9 +320,13 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     // these are not too big so keep them as it is
     quantize &= name.find("per_layer_model_proj") == std::string::npos;
 
+    // Avoid formatting warnings for architectures that do not define these tensors.
+    const std::string pos_embd_name    = std::string(LLM_TN(arch)(LLM_TENSOR_POS_EMBD)) + ".weight";
+    const std::string token_types_name = std::string(LLM_TN(arch)(LLM_TENSOR_TOKEN_TYPES)) + ".weight";
+
     // do not quantize positional embeddings and token types (BERT)
-    quantize &= name != LLM_TN(arch)(LLM_TENSOR_POS_EMBD,    "weight");
-    quantize &= name != LLM_TN(arch)(LLM_TENSOR_TOKEN_TYPES, "weight");
+    quantize &= name != pos_embd_name;
+    quantize &= name != token_types_name;
 
     // do not quantize Mamba/Kimi's small conv1d weights
     // NOTE: can't use LLM_TN here because the layer number is not known
@@ -381,6 +390,11 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
         ++qs.n_fallback;
 
         switch (target_type) {
+            case GGML_TYPE_Q4_0:
+            case GGML_TYPE_Q4_1:
+            case GGML_TYPE_Q5_0:
+            case GGML_TYPE_Q5_1:
+            case GGML_TYPE_Q8_0:    return_type = GGML_TYPE_F16;    break;
             // types on the left: block size 256
             case GGML_TYPE_IQ1_S:
             case GGML_TYPE_IQ1_M:
@@ -726,13 +740,17 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
             }
         }
 
-        // if not manual - use the standard logic for choosing the quantization type based on the selected mixture
-        if (!manual && !params->pure) {
+        // Adapter GGUFs don't carry the full set of model hparams that the mixed-model
+        // heuristics rely on, so keep them on the requested default type unless the user
+        // explicitly overrides a tensor.
+        if (!manual && !params->pure && !qs.is_adapter) {
             new_type = llama_tensor_get_type_impl(qs, new_type, tensor, params->ftype, tm.category);
         }
 
         // incompatible tensor shapes are handled here - fallback to a compatible type
-        new_type = tensor_type_fallback(qs, tensor, new_type);
+        if (ggml_is_quantized(new_type)) {
+            new_type = tensor_type_fallback(qs, tensor, new_type);
+        }
     }
 
     return new_type;
@@ -941,15 +959,26 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     auto mparams = llama_model_default_params();
     std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, mparams));
 
+    std::string general_type;
+    ml.get_key(LLM_KV_GENERAL_TYPE, general_type, false);
+    const bool is_adapter = general_type == "adapter";
+
     auto * model = dynamic_cast<llama_model_base *>(model_ptr.get());
     if (model == nullptr) {
         GGML_ABORT("fatal error: model does not implement llama_model_base");
     }
-
+    if (is_adapter) {
+        model->hparams.vocab_only = true;
+    }
     model->load_hparams(ml);
     model->load_stats  (ml);
 
     quantize_state_impl qs(*model, params);
+    qs.is_adapter = is_adapter;
+
+    if (is_adapter) {
+        LLAMA_LOG_INFO("%s: input GGUF is an adapter - using uniform tensor quantization rules\n", __func__);
+    }
 
     if (params->only_copy) {
         ftype = ml.ftype;
