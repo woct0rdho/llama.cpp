@@ -104,10 +104,12 @@ class Qwen2MoeModel(TextModel):
         if name.endswith("mlp.experts.gate_up_proj") or name.endswith("mlp.experts.gate_up_proj.weight"):
             if data_torch.ndim < 3 or data_torch.shape[-2] % 2 != 0:
                 raise ValueError(f"Unexpected gate_up_proj shape for {name}: {tuple(data_torch.shape)}")
-            # HF: [n_expert, 2*n_ff, n_embd] -> split on dim=-2
+            # HF: [n_expert, 2*n_ff, n_embd] -> split on dim=-2.
+            # Use split instead of slicing so LoRA tensor pairs can preserve their factorization.
             n_ff = data_torch.shape[-2] // 2
-            gate = data_torch[..., :n_ff, :].contiguous()
-            up = data_torch[..., n_ff:, :].contiguous()
+            gate, up = data_torch.split(n_ff, dim=-2)
+            gate = gate.contiguous()
+            up = up.contiguous()
             # gate/up: [n_expert, n_ff, n_embd] -> GGML: {n_embd, n_ff, n_expert}
             base_name = name.removesuffix(".weight").removesuffix(".gate_up_proj")
             mapped_gate = f"{base_name}.gate_proj.weight"
@@ -614,7 +616,19 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
 
             elif ".out_proj." in name:
                 # Out projection weight: reorder columns (input dimension)
-                data_torch = self._reorder_v_heads(data_torch, 1, num_k_heads, num_v_per_k, head_v_dim)
+                if hasattr(data_torch, "get_lora_A_B"):
+                    col_perm = self._reorder_v_heads(
+                        torch.arange(num_v_heads * head_v_dim, dtype=torch.long).unsqueeze(0),
+                        1, num_k_heads, num_v_per_k, head_v_dim,
+                    ).squeeze(0)
+                    lora_a, lora_b = data_torch.get_lora_A_B()
+                    # Lazy index_select on this factor can produce invalid values when written;
+                    # the factor is tiny, so materialize it before applying the input-column reorder.
+                    lora_a = LazyTorchTensor.to_eager(lora_a)
+                    col_perm = col_perm.to(device=lora_a.device, dtype=torch.long)
+                    data_torch = data_torch.__class__(lora_a.index_select(-1, col_perm), lora_b)
+                else:
+                    data_torch = self._reorder_v_heads(data_torch, 1, num_k_heads, num_v_per_k, head_v_dim)
 
         yield from super().modify_tensors(data_torch, name, bid)
 
