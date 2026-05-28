@@ -105,10 +105,12 @@ class Qwen2MoeModel(TextModel):
         if name.endswith("mlp.experts.gate_up_proj") or name.endswith("mlp.experts.gate_up_proj.weight"):
             if data_torch.ndim < 3 or data_torch.shape[-2] % 2 != 0:
                 raise ValueError(f"Unexpected gate_up_proj shape for {name}: {tuple(data_torch.shape)}")
-            # HF: [n_expert, 2*n_ff, n_embd] -> split on dim=-2
+            # HF: [n_expert, 2*n_ff, n_embd] -> split on dim=-2.
+            # Use split instead of slicing so LoRA tensor pairs can preserve their factorization.
             n_ff = data_torch.shape[-2] // 2
-            gate = data_torch[..., :n_ff, :].contiguous()
-            up = data_torch[..., n_ff:, :].contiguous()
+            gate, up = data_torch.split(n_ff, dim=-2)
+            gate = gate.contiguous()
+            up = up.contiguous()
             # gate/up: [n_expert, n_ff, n_embd] -> GGML: {n_embd, n_ff, n_expert}
             base_name = name.removesuffix(".weight").removesuffix(".gate_up_proj")
             mapped_gate = f"{base_name}.gate_proj.weight"

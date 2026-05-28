@@ -123,6 +123,13 @@ class LoraTorchTensor:
         assert len(self._lora_A.shape) == len(self._lora_B.shape)
         return (*self._lora_B.shape[:-1], self._lora_A.shape[-1])
 
+    @property
+    def ndim(self) -> int:
+        return len(self.shape)
+
+    def dim(self) -> int:
+        return self.ndim
+
     def size(self, dim=None):
         assert dim is None
         return self.shape
@@ -454,10 +461,70 @@ if __name__ == '__main__':
                 # Never add extra tensors (e.g. rope_freqs) for LoRA adapters
                 return ()
 
+            def _num_experts(self) -> int:
+                num_experts = self.hparams.get("num_local_experts", self.hparams.get("num_experts"))
+                if num_experts is None:
+                    raise ValueError("PEFT MoE LoRA tensor found, but base model config has no expert count")
+                return int(num_experts)
+
+            def _convert_peft_moe_lora_tensor(self, name: str, tensor: Tensor) -> tuple[str, Tensor]:
+                """Map PEFT MoE LoRA tensors to tensor-shaped expert LoRA pairs.
+
+                Qwen 3.5 stores gate/up and down factors as separate 3-D expert tensors,
+                while other PEFT MoE adapters may flatten the expert and rank dimensions.
+                """
+                is_gate_up = ".mlp.experts.base_layer.lora_" in name
+                is_qwen35_gate_up = self.model_arch in (gguf.MODEL_ARCH.QWEN35, gguf.MODEL_ARCH.QWEN35MOE) and (
+                    name.endswith(".mlp.experts.lora_A.weight") or name.endswith(".mlp.experts.lora_B.weight")
+                )
+                is_qwen35_down = self.model_arch in (gguf.MODEL_ARCH.QWEN35, gguf.MODEL_ARCH.QWEN35MOE) and (
+                    name.endswith(".mlp.experts.lora_A_down.weight") or name.endswith(".mlp.experts.lora_B_down.weight")
+                )
+                is_down = name.endswith(".mlp.experts.lora_A.weight") or name.endswith(".mlp.experts.lora_B.weight")
+                if is_qwen35_gate_up:
+                    is_gate_up = True
+                    is_down = False
+                elif is_qwen35_down:
+                    is_gate_up = False
+                    is_down = True
+                if not is_gate_up and not is_down:
+                    return name, tensor
+
+                num_experts = self._num_experts()
+                is_lora_a = name.endswith((".lora_A.weight", ".lora_A_down.weight"))
+                is_lora_b = name.endswith((".lora_B.weight", ".lora_B_down.weight"))
+                if tensor.ndim == 3:
+                    if tensor.shape[0] != num_experts:
+                        raise ValueError(f"Unexpected PEFT MoE tensor shape for {name}: {tuple(tensor.shape)}")
+                    tensor = tensor.contiguous()
+                elif is_lora_a and tensor.ndim == 2 and tensor.shape[0] % num_experts == 0:
+                    rank = tensor.shape[0] // num_experts
+                    tensor = tensor.reshape(num_experts, rank, tensor.shape[1]).contiguous()
+                elif is_lora_b and tensor.ndim == 2 and tensor.shape[1] % num_experts == 0:
+                    rank = tensor.shape[1] // num_experts
+                    tensor = tensor.reshape(tensor.shape[0], rank, num_experts).permute(2, 0, 1).contiguous()
+                else:
+                    factor = "lora_A" if is_lora_a else "lora_B" if is_lora_b else "LoRA"
+                    raise ValueError(f"Unexpected PEFT MoE {factor} shape for {name}: {tuple(tensor.shape)}")
+
+                if is_gate_up:
+                    name = name.replace(".mlp.experts.base_layer.", ".mlp.experts.gate_up_proj.")
+                    name = name.replace(".mlp.experts.lora_A.weight", ".mlp.experts.gate_up_proj.lora_A.weight")
+                    name = name.replace(".mlp.experts.lora_B.weight", ".mlp.experts.gate_up_proj.lora_B.weight")
+                elif is_qwen35_down:
+                    name = name.replace(".mlp.experts.lora_A_down.weight", ".mlp.experts.down_proj.lora_A.weight")
+                    name = name.replace(".mlp.experts.lora_B_down.weight", ".mlp.experts.down_proj.lora_B.weight")
+                elif name.endswith(".mlp.experts.lora_A.weight"):
+                    name = name.replace(".mlp.experts.lora_A.weight", ".mlp.experts.down_proj.lora_A.weight")
+                elif name.endswith(".mlp.experts.lora_B.weight"):
+                    name = name.replace(".mlp.experts.lora_B.weight", ".mlp.experts.down_proj.lora_B.weight")
+                return name, tensor
+
             def get_tensors(self) -> Iterator[tuple[str, Tensor]]:
                 tensor_map: dict[str, PartialLoraTensor] = {}
 
                 for name, tensor in lora_model.items():
+                    name, tensor = self._convert_peft_moe_lora_tensor(name, tensor)
                     if self.lazy:
                         tensor = LazyTorchTensor.from_eager(tensor)
                     base_name = get_base_tensor_name(name)
