@@ -43,8 +43,10 @@ class LoraTorchTensor:
     _rank: int
 
     def __init__(self, A: Tensor, B: Tensor):
-        assert len(A.shape) == len(B.shape)
-        assert A.shape[-2] == B.shape[-1]
+        if len(A.shape) != len(B.shape):
+            raise ValueError(f"LoRA factors must have the same rank, got {tuple(A.shape)} and {tuple(B.shape)}")
+        if A.shape[-2] != B.shape[-1]:
+            raise ValueError(f"LoRA factors have incompatible ranks, got {tuple(A.shape)} and {tuple(B.shape)}")
         if A.dtype != B.dtype:
             A = A.to(torch.float32)
             B = B.to(torch.float32)
@@ -420,6 +422,8 @@ if __name__ == '__main__':
 
                 super().__init__(*args, **kwargs)
 
+                # LoRA adapters are loaded alongside the base model.
+                self.gguf_writer.add_chat_template(None)
                 self.dir_model_card = dir_lora_model
                 self.lora_alpha = float(lora_alpha)
 
@@ -462,16 +466,19 @@ if __name__ == '__main__':
                 return ()
 
             def _num_experts(self) -> int:
-                num_experts = self.hparams.get("num_local_experts", self.hparams.get("num_experts"))
-                if num_experts is None:
-                    raise ValueError("PEFT MoE LoRA tensor found, but base model config has no expert count")
-                return int(num_experts)
+                for key in ("num_local_experts", "num_experts", "n_routed_experts"):
+                    num_experts = self.hparams.get(key)
+                    if num_experts is not None:
+                        return int(num_experts)
+                raise ValueError("PEFT MoE LoRA tensor found, but base model config has no expert count")
 
             def _convert_peft_moe_lora_tensor(self, name: str, tensor: Tensor) -> tuple[str, Tensor]:
                 """Map PEFT MoE LoRA tensors to tensor-shaped expert LoRA pairs.
 
-                Qwen 3.5 stores gate/up and down factors as separate 3-D expert tensors,
-                while other PEFT MoE adapters may flatten the expert and rank dimensions.
+                Qwen 3.5 stores gate/up and down factors as separate 3-D expert tensors.
+                DeepSeek-V4 stores the gate/up pair in one factor pair: its B factor
+                is concatenated on the output dimension and its A factor is shared.
+                Other PEFT MoE adapters may flatten the expert and rank dimensions.
                 """
                 is_gate_up = ".mlp.experts.base_layer.lora_" in name
                 is_qwen35_gate_up = self.model_arch in (gguf.MODEL_ARCH.QWEN35, gguf.MODEL_ARCH.QWEN35MOE) and (
@@ -480,11 +487,17 @@ if __name__ == '__main__':
                 is_qwen35_down = self.model_arch in (gguf.MODEL_ARCH.QWEN35, gguf.MODEL_ARCH.QWEN35MOE) and (
                     name.endswith(".mlp.experts.lora_A_down.weight") or name.endswith(".mlp.experts.lora_B_down.weight")
                 )
+                is_dsv4_gate_up = self.model_arch == gguf.MODEL_ARCH.DEEPSEEK4 and (
+                    name.endswith(".mlp.experts.lora_A.weight") or name.endswith(".mlp.experts.lora_B.weight")
+                )
+                is_dsv4_down = self.model_arch == gguf.MODEL_ARCH.DEEPSEEK4 and (
+                    name.endswith(".mlp.experts.lora_A_down.weight") or name.endswith(".mlp.experts.lora_B_down.weight")
+                )
                 is_down = name.endswith(".mlp.experts.lora_A.weight") or name.endswith(".mlp.experts.lora_B.weight")
-                if is_qwen35_gate_up:
+                if is_qwen35_gate_up or is_dsv4_gate_up:
                     is_gate_up = True
                     is_down = False
-                elif is_qwen35_down:
+                elif is_qwen35_down or is_dsv4_down:
                     is_gate_up = False
                     is_down = True
                 if not is_gate_up and not is_down:
@@ -493,6 +506,10 @@ if __name__ == '__main__':
                 num_experts = self._num_experts()
                 is_lora_a = name.endswith((".lora_A.weight", ".lora_A_down.weight"))
                 is_lora_b = name.endswith((".lora_B.weight", ".lora_B_down.weight"))
+                if self.model_arch == gguf.MODEL_ARCH.DEEPSEEK4 and tensor.ndim != 3:
+                    raise ValueError(
+                        f"DeepSeek-V4 PEFT MoE tensor must be expert-major 3-D: {name} has shape {tuple(tensor.shape)}"
+                    )
                 if tensor.ndim == 3:
                     if tensor.shape[0] != num_experts:
                         raise ValueError(f"Unexpected PEFT MoE tensor shape for {name}: {tuple(tensor.shape)}")
@@ -511,7 +528,7 @@ if __name__ == '__main__':
                     name = name.replace(".mlp.experts.base_layer.", ".mlp.experts.gate_up_proj.")
                     name = name.replace(".mlp.experts.lora_A.weight", ".mlp.experts.gate_up_proj.lora_A.weight")
                     name = name.replace(".mlp.experts.lora_B.weight", ".mlp.experts.gate_up_proj.lora_B.weight")
-                elif is_qwen35_down:
+                elif is_qwen35_down or is_dsv4_down:
                     name = name.replace(".mlp.experts.lora_A_down.weight", ".mlp.experts.down_proj.lora_A.weight")
                     name = name.replace(".mlp.experts.lora_B_down.weight", ".mlp.experts.down_proj.lora_B.weight")
                 elif name.endswith(".mlp.experts.lora_A.weight"):
@@ -561,11 +578,132 @@ if __name__ == '__main__':
                             tensor_map[base_name] = PartialLoraTensor(B=tensor)
 
                 for name, tensor in tensor_map.items():
-                    assert tensor.A is not None
-                    assert tensor.B is not None
+                    if tensor.A is None or tensor.B is None:
+                        missing = "lora_A" if tensor.A is None else "lora_B"
+                        raise ValueError(f"LoRA tensor pair for {name!r} is missing {missing}")
                     yield (name, cast(torch.Tensor, LoraTorchTensor(tensor.A, tensor.B)))
 
+            def _dsv4_layer_suffix(self, name: str, bid: int | None) -> str | None:
+                source = name.removeprefix("model.")
+                parts = source.split(".", 2)
+                if len(parts) != 3 or parts[0] != "layers" or not parts[1].isdecimal():
+                    return None
+                layer = int(parts[1])
+                if bid != layer:
+                    raise ValueError(f"Tensor {name!r} parsed bid {bid} but layer name has {layer}")
+                return parts[2]
+
+            def _dsv4_target_name(self, name: str, bid: int | None) -> str:
+                suffix = self._dsv4_layer_suffix(name, bid)
+                if suffix is None:
+                    raise ValueError(f"Unsupported DeepSeek-V4 LoRA tensor {name!r}")
+                target_keys: dict[str, gguf.MODEL_TENSOR] = {
+                    "self_attn.q_a_proj.weight": gguf.MODEL_TENSOR.ATTN_Q_A,
+                    "self_attn.q_b_proj.weight": gguf.MODEL_TENSOR.ATTN_Q_B,
+                    "self_attn.kv_proj.weight": gguf.MODEL_TENSOR.ATTN_KV,
+                    "self_attn.o_b_proj.weight": gguf.MODEL_TENSOR.ATTN_OUT_B,
+                    "self_attn.compressor.kv_proj.weight": gguf.MODEL_TENSOR.ATTN_COMPRESSOR_WKV,
+                    "self_attn.compressor.gate_proj.weight": gguf.MODEL_TENSOR.ATTN_COMPRESSOR_WGATE,
+                    "mlp.shared_experts.gate_proj.weight": gguf.MODEL_TENSOR.FFN_GATE_SHEXP,
+                    "mlp.shared_experts.up_proj.weight": gguf.MODEL_TENSOR.FFN_UP_SHEXP,
+                    "mlp.shared_experts.down_proj.weight": gguf.MODEL_TENSOR.FFN_DOWN_SHEXP,
+                    "mlp.experts.down_proj.weight": gguf.MODEL_TENSOR.FFN_DOWN_EXP,
+                }
+                key = target_keys.get(suffix)
+                if key is None:
+                    raise ValueError(f"Unsupported DeepSeek-V4 LoRA target {name!r}")
+                assert bid is not None
+                return self.format_tensor_name(key, bid)
+
+            def _dsv4_expected_shape(self, suffix: str, bid: int) -> tuple[int, ...]:
+                hidden = int(self.hparams["hidden_size"])
+                intermediate = int(self.hparams["moe_intermediate_size"])
+                experts = self._num_experts()
+                shared = int(self.hparams["n_shared_experts"])
+                head_dim = int(self.hparams["head_dim"])
+                if suffix == "self_attn.q_a_proj.weight":
+                    return int(self.hparams["q_lora_rank"]), hidden
+                if suffix == "self_attn.q_b_proj.weight":
+                    return int(self.hparams["num_attention_heads"]) * head_dim, int(self.hparams["q_lora_rank"])
+                if suffix == "self_attn.kv_proj.weight":
+                    return head_dim, hidden
+                if suffix == "self_attn.o_b_proj.weight":
+                    return hidden, int(self.hparams["o_groups"]) * int(self.hparams["o_lora_rank"])
+                if suffix.startswith("self_attn.compressor."):
+                    ratios = self.hparams["compress_ratios"]
+                    ratio = int(ratios[bid])
+                    if ratio not in (4, 128):
+                        raise ValueError(f"DeepSeek-V4 compressor LoRA target is invalid at layer {bid}: ratio {ratio}")
+                    width = (2 if ratio == 4 else 1) * head_dim
+                    return width, hidden
+                if suffix in ("mlp.shared_experts.gate_proj.weight", "mlp.shared_experts.up_proj.weight"):
+                    return shared * intermediate, hidden
+                if suffix == "mlp.shared_experts.down_proj.weight":
+                    return hidden, shared * intermediate
+                if suffix == "mlp.experts.gate_up_proj.weight":
+                    return experts, 2 * intermediate, hidden
+                if suffix == "mlp.experts.down_proj.weight":
+                    return experts, hidden, intermediate
+                raise ValueError(f"Unsupported DeepSeek-V4 LoRA target {suffix!r}")
+
+            @staticmethod
+            def _validate_lora_pair(name: str, lora_a: Tensor, lora_b: Tensor, expected: tuple[int, ...]) -> None:
+                a_shape = tuple(int(dim) for dim in lora_a.shape)
+                b_shape = tuple(int(dim) for dim in lora_b.shape)
+                if len(expected) == 2:
+                    valid = (
+                        len(a_shape) == 2 and len(b_shape) == 2
+                        and a_shape[1] == expected[1]
+                        and b_shape[0] == expected[0]
+                        and a_shape[0] == b_shape[1]
+                    )
+                else:
+                    valid = (
+                        len(a_shape) == 3 and len(b_shape) == 3
+                        and a_shape[0] == expected[0] and b_shape[0] == expected[0]
+                        and a_shape[2] == expected[2] and b_shape[1] == expected[1]
+                        and a_shape[1] == b_shape[2]
+                    )
+                if not valid:
+                    raise ValueError(
+                        f"Incompatible LoRA factors for {name}: got A {a_shape}, B {b_shape}; "
+                        f"expected a rank-compatible decomposition of {expected}"
+                    )
+
+            def _modify_dsv4_tensors(self, data_torch: Tensor, name: str, bid: int) -> Iterable[tuple[str, Tensor]]:
+                suffix = self._dsv4_layer_suffix(name, bid)
+                assert suffix is not None
+                if not isinstance(data_torch, LoraTorchTensor):
+                    raise TypeError(f"DeepSeek-V4 LoRA target {name!r} is not a factor pair")
+                lora_a, lora_b = data_torch.get_lora_A_B()
+
+                if suffix == "mlp.experts.gate_up_proj.weight":
+                    expected = self._dsv4_expected_shape(suffix, bid)
+                    self._validate_lora_pair(name, lora_a, lora_b, expected)
+                    split_size = expected[1] // 2
+                    gate_b, up_b = lora_b.split(split_size, dim=1)
+                    for key, part in (
+                        (gguf.MODEL_TENSOR.FFN_GATE_EXP, gate_b),
+                        (gguf.MODEL_TENSOR.FFN_UP_EXP, up_b),
+                    ):
+                        target = self.format_tensor_name(key, bid)
+                        self._validate_lora_pair(target, lora_a, part, (expected[0], split_size, expected[2]))
+                        yield (target + ".lora_a", lora_a)
+                        yield (target + ".lora_b", part)
+                    return
+
+                target = self._dsv4_target_name(name, bid)
+                expected = self._dsv4_expected_shape(suffix, bid)
+                self._validate_lora_pair(target, lora_a, lora_b, expected)
+                yield (target + ".lora_a", lora_a)
+                yield (target + ".lora_b", lora_b)
+
             def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+                if self.model_arch == gguf.MODEL_ARCH.DEEPSEEK4 and bid is not None:
+                    suffix = self._dsv4_layer_suffix(name, bid)
+                    if suffix is not None:
+                        yield from self._modify_dsv4_tensors(data_torch, name, bid)
+                        return
                 dest = list(super().modify_tensors(data_torch, name, bid))
                 # some archs may have the same tensor for lm_head and output (tie word embeddings)
                 # in this case, adapters targeting lm_head will fail when using llama-export-lora
@@ -605,7 +743,10 @@ if __name__ == '__main__':
             dir_lora_model=dir_lora,
             lora_alpha=alpha,
             hparams=hparams,
-            remote_hf_model_id=base_model_id,
+            # The adapter exporter only needs config metadata.  Passing the HF
+            # model ID here would enumerate every remote weight shard even
+            # though no base tensor is converted.
+            remote_hf_model_id=None,
         )
 
         logger.info("Exporting model...")
