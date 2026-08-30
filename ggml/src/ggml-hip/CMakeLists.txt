@@ -92,6 +92,10 @@ if (GGML_EXL3)
     target_compile_definitions(ggml-hip PRIVATE GGML_USE_EXL3)
 endif()
 
+if (WIN32 AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    target_include_directories(ggml-hip PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/hip-compat")
+endif()
+
 # TODO: do not use CUDA definitions for HIP
 if (NOT GGML_BACKEND_DL)
     target_compile_definitions(ggml PUBLIC GGML_USE_CUDA)
