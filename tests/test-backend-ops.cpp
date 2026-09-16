@@ -14139,6 +14139,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // concat(a, ggml_transpose(b), 0): b is contiguous along the axis dst is strided along
+    for (ggml_type t : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_I32}) {
+        test_cases.emplace_back(new test_concat(t, {3, 10240, 1, 1}, 2048, 0, 16)); // qwen4exp gdn conv input
+        test_cases.emplace_back(new test_concat(t, {3,   100, 1, 1},   77, 0, 16)); // ragged tiles
+        test_cases.emplace_back(new test_concat(t, {5,    33, 1, 1},   31, 0, 16));
+        test_cases.emplace_back(new test_concat(t, {1,    32, 1, 1},   32, 0, 16)); // exact tile
+        test_cases.emplace_back(new test_concat(t, {7,     1, 1, 1},    1, 0, 16)); // degenerate
+    }
+
     for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0 }) {
         for (int v : { 0, 4, 8, 12 }) {
             for (int dim : { 0, 1, 2, 3, }) {
@@ -15636,6 +15645,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 64, 128, 1024, 1)); // H64/S128 PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 64, 128, 2048, 1)); // H64/S128 PP-2048
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2048, 1, 3)); // Flash-Next ub2048: 16 q/k heads, 48 v heads
+
+    // qwen4exp gdn conv input: concat(state, ggml_transpose(x), 0), [3+2048, 10240]
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 10240, 1, 1}, 2048, 0, 16));
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {32, 10240, 1, 1}, 2048, 0, 16)); // ne0=2080, 64B-aligned rows
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {0,  10240, 1, 1}, 2048, 0, 16)); // ne0=2048, pure transpose
+    // qwen4exp (Qwen3.8-Flash-Next): 16 k/q groups, 48 value heads, d=128
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  512, 1, 3));
     // Small model configs (fewer heads = less GPU occupancy for autoregressive)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 64, 1));   // 4h PP-64
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 256, 1));  // 4h PP-256
