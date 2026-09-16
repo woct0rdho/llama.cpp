@@ -2155,16 +2155,13 @@ public:
         // exactly one of the two is built: `rows` when the table is a tensor and the
         // graph does the get_rows, `embd` when set_input gathered it on the host.
         // Dereferencing `rows` unconditionally segfaults on every on-disk decode.
-        if (rows) {
-            return rows->ne[0] == n_want;      // I32 [n_heads*n_tokens]
-        }
         if (embd) {
             return embd->ne[1] == n_want;      // F32 [ple_head_dim, n_heads*n_tokens]
         }
-        return false;
+        return rows.can_reuse(n_want);
     }
 
-    ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
+    llm_graph_lazy_rows rows;   // ple_n_heads * n_tokens rows of per_layer_tok_embd
     ggml_tensor * embd = nullptr;   // F32 [ple_head_dim, ple_n_heads * n_tokens]: the gathered rows, when the table is on disk
 
     std::vector<float>   embd_buf;
@@ -2542,7 +2539,6 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         // host-gathered table (memory-mapped / in RAM, or the on-disk reader): the rows arrive as an F32 input.
         // idx is exactly what the gathers want: one global row per (token, head), token-major, with
         // ple_head_offsets folded in by the loop above.
-        GGML_ASSERT(rows == nullptr);
         const int64_t dim = hp.ple_head_dim;
         if (!pmodel.ple_disk) {
             const ggml_tensor * tab = pmodel.per_layer_tok_embd;
@@ -2604,7 +2600,7 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     // page fault the CPU get_rows would otherwise take one after another (~0.2 ms each from NVMe).
     // Ask the kernel to read all of them in parallel now; the gather then finds them (or the I/O in
     // flight) in the page cache.
-    if (const ggml_tensor * tab = pmodel.per_layer_tok_embd; tab && tab->data) {
+    if (const ggml_tensor * tab = pmodel.per_layer_tok_embd; tab && tab->data && !pmodel.lazy_reader(tab)) {
         const long page = sysconf(_SC_PAGESIZE);
         if (page > 0) {
             const uintptr_t base     = (uintptr_t) tab->data;
@@ -2623,7 +2619,7 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     }
 #endif
 
-    ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+    rows.set_rows(idx.data(), (int64_t) idx.size());
 }
 
 // Read a conv history out of its own recurrent row and write the new tail back.
@@ -2694,15 +2690,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     ple_inp->ring = qwen4exp_ring(prefetch);
 
     const auto & qmodel = static_cast<const llama_model_qwen4exp &>(model);
-    ggml_tensor * rows = nullptr;
     ggml_tensor * emb  = nullptr;
 
     // A host-resident table (memory-mapped or loaded into RAM) is gathered on the host too: a
     // get_rows node on the CPU backend would cut the graph into three splits (GPU, CPU, GPU) with
     // an extra graph launch and a device sync per ubatch. Only a table that lives on a device is
-    // gathered by the graph.
-    const bool host_gather = qmodel.ple_disk ||
-        (model.per_layer_tok_embd && model.per_layer_tok_embd->buffer && ggml_backend_buffer_is_host(model.per_layer_tok_embd->buffer));
+    // gathered by the graph. With --lazy-mode on-direct the table is read by the lazy reader and
+    // the rows are staged by set_input(), so the graph path below applies.
+    const bool host_gather = !model.lazy_reader(model.per_layer_tok_embd) && (qmodel.ple_disk ||
+        (model.per_layer_tok_embd && model.per_layer_tok_embd->buffer && ggml_backend_buffer_is_host(model.per_layer_tok_embd->buffer)));
 
     if (host_gather) {
         // the gather happens in set_input and arrives as an F32 input,
@@ -2711,16 +2707,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
         ggml_set_input(ple_inp->embd);
         emb = ple_inp->embd;
     } else {
-        ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
-        ggml_set_input(ple_inp->rows);
-        rows = ple_inp->rows;
+        emb = ple_inp->rows.build(ctx0, model.per_layer_tok_embd,
+                model.lazy_reader(model.per_layer_tok_embd), n_heads * n_tokens);
     }
     res->add_input(std::move(ple_inp));
 
-    if (rows != nullptr) {
-        // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
-        emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
-    }
+    // flatten the heads: the gather lays the head dimension out slowest, as the reference does
     emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
     cb(emb, "ple_embd", -1);
 
