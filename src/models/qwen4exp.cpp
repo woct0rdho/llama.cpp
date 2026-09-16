@@ -1203,10 +1203,10 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
-        return rows->ne[0] == (int64_t) model.hparams.ple_n_heads * params.ubatch.n_tokens;
+        return rows.can_reuse((int64_t) model.hparams.ple_n_heads * params.ubatch.n_tokens);
     }
 
-    ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
+    llm_graph_lazy_rows rows;   // ple_n_heads * n_tokens rows of per_layer_tok_embd
 
     const llama_model & model;
 
@@ -1281,13 +1281,13 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
     {
         ggml_tensor * ple = model.per_layer_tok_embd;
 
-        const bool prefetch = model.can_prefetch.count(ple);
-        if (prefetch) {
+        // mmap reads fault a page per row, so read the rows ahead; on-direct stages them instead
+        if (model.can_prefetch.count(ple) && !model.lazy_reader(ple)) {
             llama_prefetch_rows(ple, idx.data(), idx.size());
         }
     }
 
-    ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+    rows.set_rows(idx.data(), (int64_t) idx.size());
 }
 
 // Read a conv history out of its own recurrent row and write the new tail back.
@@ -1353,13 +1353,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     // the attention cells see every ubatch regardless of the layer types
     auto ple_inp = std::make_unique<llm_graph_input_qwen4exp_ple>(model, mctx_hyb->get_attn());
 
-    ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
-    ggml_set_input(ple_inp->rows);
-    ggml_tensor * rows = ple_inp->rows;
+    ggml_tensor * emb = ple_inp->rows.build(ctx0, model.per_layer_tok_embd,
+            model.lazy_reader(model.per_layer_tok_embd), n_heads * n_tokens);
     res->add_input(std::move(ple_inp));
 
-    // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
-    ggml_tensor * emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
+    // flatten the heads: the gather lays the head dimension out slowest, as the reference does
     emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
     cb(emb, "ple_embd", -1);
 
