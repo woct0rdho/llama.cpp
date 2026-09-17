@@ -28,6 +28,7 @@
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
+#include "ggml-cuda/lora.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
@@ -1893,6 +1894,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;
     }
+    if (ggml_cuda_should_use_mm_lora(dst, cc)) {
+        ggml_cuda_mul_mat_lora(ctx, dst);
+        return;
+    }
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
 }
 
@@ -1901,6 +1906,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
+
+    // the LoRA kernels stay on the device, no sync is needed
+    if (ggml_cuda_should_use_mmid_lora(dst, cc)) {
+        return false;
+    }
 
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return true;
@@ -1955,6 +1965,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                     return;
                 }
             }
+        }
+
+        if (ggml_cuda_should_use_mmid_lora(dst, cc)) {
+            ggml_cuda_mul_mat_id_lora(ctx, dst);
+            return;
         }
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
