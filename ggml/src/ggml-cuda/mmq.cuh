@@ -225,6 +225,12 @@ struct ggml_cuda_mmq_config {
 #include "mmq-config-rdna3-5.cuh"
 #include "mmq-config-rdna4.cuh"
 
+static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config_rdna3_5_tuned(ggml_type type, int J, bool fallback) {
+    const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config_rdna3_5(type, J, fallback);
+    return ggml_cuda_mmq_config(
+        config.type, 128, config.occupancy, 64, config.J, config.sram_layout, config.K_vram, config.stream_k, config.fallback);
+}
+
 #undef CASE
 
 static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type type, const int J, const bool fallback, const int cc) {
@@ -239,7 +245,7 @@ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type ty
             return ggml_cuda_mmq_get_config_rdna4(type, J, fallback);
         }
         if (GGML_CUDA_CC_IS_RDNA3_5(cc)) {
-            return ggml_cuda_mmq_get_config_rdna3_5(type, J, fallback);
+            return ggml_cuda_mmq_get_config_rdna3_5_tuned(type, J, fallback);
         }
         if (GGML_CUDA_CC_IS_RDNA3(cc)) {  // covers RDNA 3.0
             return ggml_cuda_mmq_get_config_rdna3(type, J, fallback);
@@ -267,7 +273,7 @@ static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_t
 #elif defined(RDNA4)
     return ggml_cuda_mmq_get_config_rdna4(type, J, fallback);
 #elif defined(RDNA3_5)
-    return ggml_cuda_mmq_get_config_rdna3_5(type, J, fallback);
+    return ggml_cuda_mmq_get_config_rdna3_5_tuned(type, J, fallback);
 #elif defined(RDNA3)
     return ggml_cuda_mmq_get_config_rdna3(type, J, fallback);
 #else
@@ -1484,12 +1490,13 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 }
 
 // the J whose tile covers ncols_opt in the fewest tiles, among those that fit in shared memory
+// j_max caps the search, which RDNA3.5 uses for the MoE path
 template <ggml_type type, bool fallback>
-static int mmq_select_J(const int cc, const size_t smpbo, const int64_t ncols_opt) {
+static int mmq_select_J(const int cc, const size_t smpbo, const int64_t ncols_opt, const int J_max = 128) {
     int J_best        = 0;
     int ntiles_J_best = INT_MAX;
 
-    for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
+    for (int J = 8; J <= J_max && ntiles_J_best > 1; J += 8) {
         const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
         if (config.type == GGML_TYPE_COUNT) {
             continue;
@@ -1516,7 +1523,9 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
     const int    cc    = ggml_cuda_info().devices[id].cc;
     const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
 
-    const int J_best = mmq_select_J<type, fallback>(cc, smpbo, args.ncols_opt);
+    // Strix Halo loses more to fragmented tiles than it gains from a wider J on cold experts
+    const int J_max  = GGML_CUDA_CC_IS_RDNA3_5(cc) && args.expert_bounds != nullptr ? 48 : 128;
+    const int J_best = mmq_select_J<type, fallback>(cc, smpbo, args.ncols_opt, J_max);
 
     switch (J_best) {
         case   8:
