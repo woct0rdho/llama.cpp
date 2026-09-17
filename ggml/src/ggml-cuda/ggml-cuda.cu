@@ -379,7 +379,13 @@ static ggml_cuda_device_info ggml_cuda_init() {
     // unchanged. Only enabled where it has been measured; an explicit setting by the user wins.
     for (int id = 0; id < info.device_count; ++id) {
         if (GGML_CUDA_CC_IS_RDNA3_5(info.devices[id].cc)) {
-            setenv("ROCBLAS_USE_HIPBLASLT", "1", /*overwrite =*/ 0);
+            if (getenv("ROCBLAS_USE_HIPBLASLT") == nullptr) {
+#ifdef _WIN32
+                _putenv_s("ROCBLAS_USE_HIPBLASLT", "1");
+#else
+                setenv("ROCBLAS_USE_HIPBLASLT", "1", /*overwrite =*/ 0);
+#endif
+            }
             break;
         }
     }
