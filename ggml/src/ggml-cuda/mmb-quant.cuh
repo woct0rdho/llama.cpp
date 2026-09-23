@@ -230,32 +230,18 @@ __device__ __forceinline__ void mmb_load_quant_tile(const uint8_t * weights, siz
 }
 
 static bool mmb_quant_type(ggml_type type) {
+    // Per-type MMB vs MMQ at the qwen4exp shapes: MMB wins for IQ4_NL, Q8_0 and IQ1_M; the
+    // codebook quants (IQ1_S/IQ2_*/IQ3_*), IQ4_XS and the K-quants are 1.3-5.7x faster on MMQ
+    // and stay there. MXFP4/NVFP4 use the same LUT-style dequant as IQ4_NL.
     switch (type) {
-        case GGML_TYPE_Q1_0:
-        case GGML_TYPE_Q2_0:
-        case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q4_1:
-        case GGML_TYPE_Q5_0:
-        case GGML_TYPE_Q5_1:
-        case GGML_TYPE_Q8_0:
-        case GGML_TYPE_Q2_K:
-        case GGML_TYPE_Q3_K:
-        case GGML_TYPE_Q4_K:
-        case GGML_TYPE_Q5_K:
-        case GGML_TYPE_Q6_K:
-        case GGML_TYPE_IQ1_S:
-        case GGML_TYPE_IQ1_M:
-        case GGML_TYPE_IQ2_XXS:
-        case GGML_TYPE_IQ2_XS:
-        case GGML_TYPE_IQ2_S:
-        case GGML_TYPE_IQ3_XXS:
-        case GGML_TYPE_IQ3_S:
-        case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_IQ1_M:
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_NVFP4:
             return true;
-        default: return false;
+        default:
+            return false;
     }
 }
 
