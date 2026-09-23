@@ -5208,6 +5208,18 @@ struct test_mul_mat_id : public test_case {
 };
 
 // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
+struct test_mmb_quant_dense : test_mul_mat {
+    explicit test_mmb_quant_dense(ggml_type type, int tokens, int rows, int inner)
+        : test_mul_mat(type, GGML_TYPE_F32, rows, tokens, inner, {1, 1}, {1, 1}) {}
+    std::string op_desc(ggml_tensor *) override { return "MMB_QUANT"; }
+};
+
+struct test_mmb_quant_routed : test_mul_mat_id {
+    test_mmb_quant_routed(ggml_type type, int tokens, bool broadcast, int rows = 128)
+        : test_mul_mat_id(type, GGML_TYPE_F32, 8, 2, broadcast, rows, tokens, 256) {}
+    std::string op_desc(ggml_tensor *) override { return "MMB_QUANT"; }
+};
+
 struct test_mul_mat_id_fusion : public test_case {
     const ggml_type type_a;
     const ggml_type type_b;
@@ -9172,6 +9184,14 @@ static const ggml_type other_types[] = {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     std::default_random_engine rng(0);
+
+    // MMB quant coverage: the BF16 WMMA dequant path engages from 512 tokens up
+    for (ggml_type type : {GGML_TYPE_Q1_0, GGML_TYPE_Q2_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL, GGML_TYPE_MXFP4, GGML_TYPE_NVFP4}) {
+        test_cases.emplace_back(new test_mmb_quant_dense(type, 512, 128, 256));
+        test_cases.emplace_back(new test_mmb_quant_dense(type, 513, 129, 512));
+        test_cases.emplace_back(new test_mmb_quant_routed(type, 512, false));
+        test_cases.emplace_back(new test_mmb_quant_routed(type, 513, true));
+    }
 
     // unary ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
