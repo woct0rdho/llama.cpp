@@ -396,8 +396,9 @@ static void launch_gated_delta_net(
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     if constexpr (!KDA) {
         if (!no_tiled && GGML_CUDA_CC_IS_RDNA3_5(cc) && S_v == 128 && n_tokens >= 16) {
-            constexpr int tiled_warps = 16;
-            constexpr int tiled_cols  = 4;
+            // 8x8x16 beats the previous 16x4x16 by ~1.3% at 16384 tokens; DPP stays on
+            constexpr int tiled_warps = 8;
+            constexpr int tiled_cols  = 8;
             constexpr int tiled_tile  = 16;
 
             const dim3 tiled_grid(H, n_seqs, 128 / (tiled_warps*tiled_cols));
