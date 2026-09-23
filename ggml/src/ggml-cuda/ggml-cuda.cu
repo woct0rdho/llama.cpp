@@ -4637,6 +4637,15 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
 
     static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
 
+    // resident BF16 shadows for the Q6_K LM head and, in shadow mode 1, dense IQ4_NL weights
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * t = cgraph->nodes[i];
+        if (t->op == GGML_OP_MUL_MAT && (t->src[0]->type == GGML_TYPE_IQ4_NL || t->src[0]->type == GGML_TYPE_Q6_K) &&
+                ggml_cuda_mmb_supported_mm(t->src[0], t->src[1], t)) {
+            ggml_cuda_mmb_shadow_prepare(*cuda_ctx, t->src[0]);
+        }
+    }
+
     if (ggml_cuda_mmb_down16()) {
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             ggml_cuda_moe_weighted_reduction_match match;
@@ -4663,6 +4672,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             ggml_cuda_mmb_mark_bf16_only(ex);
         }
     }
+
     auto add_alloc_deps = [&](size_t start, size_t last_node) {
 
         for (size_t i = start; i < last_node; ++i) {
