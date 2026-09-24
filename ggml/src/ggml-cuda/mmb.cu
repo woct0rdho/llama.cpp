@@ -757,6 +757,14 @@ static uint16_t * mmb_cache_insert(ggml_backend_cuda_context & ctx, const ggml_t
     return buf->get();
 }
 static const uint16_t * mmb_bf16_activation(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const size_t n, cudaStream_t stream) {
+    // A marked tensor keeps its BF16 form in place in its own buffer and never writes the F32 one, so it can
+    // only be read from there. Offset-0 views are the only ones the marking pass allows, and the caller asks
+    // for the full tensor, which is what the in-place layout covers.
+    if (ggml_cuda_mmb_is_bf16_only(src1)) {
+        const ggml_tensor * v = src1->view_src ? src1->view_src : src1;
+        GGML_ASSERT(ggml_is_contiguous(v) && src1->view_offs == 0 && ggml_nelements(v) == (int64_t) n);
+        return (const uint16_t *) v->data;
+    }
     const ggml_tensor * root = mmb_root(src1);
     for (auto & e : g_mmb_slots) if (e.buf && e.root == root && e.data == src1->data && e.n == n) return e.buf->get();
     for (auto & e : g_mmb_cache) if (e.root == root && e.data == src1->data && e.n == n) return e.buf->get();
