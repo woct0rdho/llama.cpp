@@ -5,6 +5,7 @@
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/mmb.cuh"
+#include "ggml-cuda/hc-cn.cuh"
 #include "ggml-cuda/idx-relu-sum.cuh"
 #include "ggml-cuda/norm-gated.cuh"
 #include "ggml-cuda/gdn-conv.cuh"
@@ -3532,6 +3533,116 @@ static int ggml_cuda_match_idx_relu_sum(const ggml_cgraph * g, int i, ggml_cuda_
     return count;
 }
 
+
+// The hyper-connection combine writes the residual and the grouped norm that follows reads it back, so
+// both run in one kernel. Whether the residual can stay in BF16 must be decided from the graph alone:
+// the producer and every consumer evaluate the same question independently, which also keeps the answer
+// stable across HIP graph captures.
+static bool ggml_cuda_hc_cn_match(const ggml_cgraph * cgraph, int i, int * rms_idx, int * mul_idx) {
+    const ggml_tensor * node = cgraph->nodes[i];
+    if (node->op != GGML_OP_DSV4_HC_POST || node->src[3] != nullptr) {
+        return false;
+    }
+    const ggml_tensor * blk  = node->src[0];
+    const ggml_tensor * res  = node->src[1];
+    const ggml_tensor * post = node->src[2];
+    if (node->type != GGML_TYPE_F32 || blk->type != GGML_TYPE_F32 || res->type != GGML_TYPE_F32 || post->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_is_contiguous(node) || !ggml_is_contiguous(blk) || !ggml_is_contiguous(res) || !ggml_is_contiguous(post)) {
+        return false;
+    }
+    const int64_t n_embd = node->ne[0];
+    const int64_t hc     = node->ne[1];
+    const int64_t n_tok  = node->ne[2];
+    if (n_embd <= 0 || n_embd > HC_CN_CHUNK * HC_CN_BLOCK || hc <= 0 || hc > 32 || node->ne[3] != 1 || res->ne[3] != 1) {
+        return false;
+    }
+    if (res->ne[0] != n_embd || res->ne[1] != hc || res->ne[2] != n_tok ||
+        blk->ne[0] != n_embd || blk->ne[1] != n_tok || blk->ne[2] != 1 ||
+        post->ne[0] != hc || post->ne[1] != n_tok || post->ne[2] != 1) {
+        return false;
+    }
+
+    int j = -1;
+    for (int n = i + 1; n < cgraph->n_nodes && n <= i + 6; ++n) {
+        const ggml_tensor * t = cgraph->nodes[n];
+        if (j < 0) {
+            if (t->op == GGML_OP_RMS_NORM && t->src[0] == node) {
+                j = n;
+            }
+            continue;
+        }
+        if (t->op == GGML_OP_MUL && (t->src[0] == cgraph->nodes[j] || t->src[1] == cgraph->nodes[j]) &&
+            t->src[0] != node && t->src[1] != node) {
+            const ggml_tensor * g = t->src[0] == cgraph->nodes[j] ? t->src[1] : t->src[0];
+            if (g->type == GGML_TYPE_F32 && ggml_is_contiguous(g) && g->ne[0] == n_embd && g->ne[1] == hc &&
+                t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && t->ne[0] == n_embd && t->ne[1] == hc && t->ne[2] == n_tok &&
+                ggml_node_has_n_uses(cgraph, j, 1)) {
+                if (rms_idx) *rms_idx = j;
+                if (mul_idx) *mul_idx = n;
+                return true;
+            }
+            return false;
+        }
+    }
+    return false;
+}
+
+static int ggml_cuda_hc_producer_idx(const ggml_cgraph * cgraph, const ggml_tensor * t) {
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        if (cgraph->nodes[i] == t) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static bool ggml_cuda_hc_res16_ok(const ggml_cgraph * cgraph, const ggml_tensor * res, int producer_idx) {
+    if (!ggml_cuda_mmb_res16() || producer_idx < 0 || !ggml_is_contiguous(res) || res->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    int rms_idx = -1;
+    int mul_idx = -1;
+    if (!ggml_cuda_hc_cn_match(cgraph, producer_idx, &rms_idx, &mul_idx)) {
+        return false;   // the producer has to be one that writes BF16
+    }
+    // ... and one that is actually fused: if the alias check refuses it, the combine writes F32 and every
+    // reader here would decode BF16 out of that. Same condition as the dispatch below.
+    const int producer_out[2] = { producer_idx, mul_idx };
+    if (!ggml_cuda_check_fusion_memory_ranges(cgraph, producer_idx, mul_idx - producer_idx + 1, producer_out, 2)) {
+        return false;
+    }
+
+    for (int n = 0; n < cgraph->n_nodes; ++n) {
+        const ggml_tensor * t = cgraph->nodes[n];
+        if (n == producer_idx) {
+            continue;
+        }
+
+        bool reads = false;
+        for (int s = 0; s < GGML_MAX_SRC && !reads; ++s) {
+            const ggml_tensor * src = t->src[s];
+            while (src != nullptr && (src->op == GGML_OP_RESHAPE || src->op == GGML_OP_VIEW)) {
+                src = src->view_src;
+            }
+            reads = src == res;
+        }
+        if (!reads) {
+            continue;
+        }
+        if (n == rms_idx) {
+            continue;   // the norm is fused into the producer
+        }
+        if (t->op == GGML_OP_DSV4_HC_POST && ggml_cuda_hc_cn_match(cgraph, n, nullptr, nullptr)) {
+            continue;   // the next combine also reads BF16
+        }
+        return false;
+    }
+    return true;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -3540,6 +3651,46 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // The combine and the grouped norm after it run as one kernel: the residual is read once, the norm
+    // row stays in registers. The matcher is pure structure so that graph capture replays the same code.
+    if (node->op == GGML_OP_DSV4_HC_POST && ggml_cuda_mmb_res16() &&
+        GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+        int j = -1, k = -1;
+        if (ggml_cuda_hc_cn_match(cgraph, i, &j, &k)) {
+            ggml_tensor * mul = cgraph->nodes[k];
+            const ggml_tensor * rms = cgraph->nodes[j];
+            const ggml_tensor * gamma = mul->src[0] == rms ? mul->src[1] : mul->src[0];
+
+            // The kernel writes the MUL's tensor at the combine's position. If that buffer is aliased with
+            // a tensor the scheduler still considers live there, an early write would clobber it.
+            const int out_nodes[2] = { i, k };
+            if (!ggml_cuda_check_fusion_memory_ranges(cgraph, i, k - i + 1, out_nodes, 2)) {
+                return 0;
+            }
+
+            ggml_cuda_hc_combine_norm_args args;
+            args.post      = node->src[2];
+            args.residual  = node->src[1];
+            args.block_out = node->src[0];
+            args.gamma     = gamma;
+            args.out_res   = node;
+            args.out_xn    = mul;
+            args.eps       = ggml_get_op_params_f32(rms, 0);
+
+            const int res_producer = ggml_cuda_hc_producer_idx(cgraph, node->src[1]);
+            if (res_producer >= 0 && ggml_cuda_hc_res16_ok(cgraph, node->src[1], res_producer)) {
+                args.res_in_bf16 = (const uint16_t *) node->src[1]->data;
+            }
+            if (ggml_cuda_hc_res16_ok(cgraph, node, i)) {
+                args.res_out_bf16 = (uint16_t *) node->data;
+            }
+            args.out_xn_bf16 = ggml_cuda_mmb_cache_reserve(*cuda_ctx, mul, (size_t) ggml_nelements(mul));
+
+            ggml_cuda_op_hc_combine_norm(*cuda_ctx, args);
+            return k - i;
+        }
+    }
 
     // The HC gate projection [hc_lr -> hc*n_embd] is read only by the stream mix that follows it, so the
     // GEMM, the sigmoid and the mix collapse into one kernel and the gate never reaches memory. This only
@@ -4746,6 +4897,19 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             }
         }
     };
+
+    // The combine+norm fusion writes the MUL's tensor at the combine's position, so its buffer must not be
+    // shared with anything that is still live there. Register the allocation dependencies that make the
+    // allocator separate them; the dispatch below still rechecks and refuses if it did not.
+    if (!disable_fusion && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            int j = -1, k = -1;
+            if (!ggml_cuda_hc_cn_match(cgraph, i, &j, &k)) {
+                continue;
+            }
+            add_alloc_deps(i, k);
+        }
+    }
 
     if (!disable_fusion) {
         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
