@@ -1,0 +1,301 @@
+# qwen4exp optimization plan for gfx1151 (forward, batch 1, ROCm)
+
+Scope: Qwen3.8-Flash-Next on gfx1151 (Radeon 8060S, 40 CU, wave32, 64 KB LDS/CU, LPDDR5-8000 256-bit). Forward kernels only, single sequence (batch 1). ROCm only. Context up to 262144 in production.
+
+Models and quant mix (MiB of weights, active per token unless marked):
+
+| tensor group | IQ4_NL | GSQ-RCO-Q2_0 |
+| --- | --- | --- |
+| experts (all 512) | IQ4_NL 64800 | Q2_0 32400 |
+| experts (10 used) | IQ4_NL 1266 | Q2_0 633 |
+| linear attn (gdn) | IQ4_NL 308 | IQ4_XS 135, Q4_K 93, Q5_K 31, Q6_K 25, Q3_K 19, BF16 17, F32 6 |
+| full attn + indexer | IQ4_NL 1012, BF16 38, Q8_0 32 | BF16 641, Q3_K 434, IQ4_XS 273, Q4_K 118, Q6_K 53, Q5_K 46, Q2_0 20, F32 2 |
+| hyper-connections | IQ4_NL 340 | BF16 616, F32 2 |
+| ffn misc / ple | F32 241, IQ4_NL 127, Q8_0 33 | IQ4_NL 27466 (ple), BF16 132 (router), shared experts 82 |
+| embed + lm head | Q6_K 645, IQ4_NL 341 | Q5_K 417, Q3_K 260 |
+
+Current state, code commit `5d40441eb`, build 12038, kernel 7.0.0-38, PM4 on, `power_dpm_force_performance_level=auto`, sclk 2.45 GHz median / 2.85 GHz p95 (2.90 max) sampled during the runs:
+
+```
+DEBUG_HIP_GRAPH_PM4=1 build/bin/llama-bench -m <model>.gguf -ngl 99 -fa on -b 8192 -ub 8192 -dev ROCm0 -p 512   -n 128 -r 3
+DEBUG_HIP_GRAPH_PM4=1 build/bin/llama-bench -m <model>.gguf -ngl 99 -fa on -b 8192 -ub 8192 -dev ROCm0 -p 16384 -n 0   -r 1
+```
+
+| model | pp512 @ d0 | pp16384 @ d0 | tg128 @ d0 |
+| --- | ---: | ---: | ---: |
+| IQ4_NL (93.16 GiB) | 1165.4 ± 29.6 | 1531.9 | 40.57 ± 0.11 |
+| GSQ-RCO-Q2_0 (61.85 GiB) | 944.0 ± 13.5 | 1253.3 | 37.57 ± 0.07 |
+
+pp16384 is a `-ub` figure: the same IQ4_NL test at `-b 8192 -ub 512` measures 950.9, and a server left on the default `-ub 512` lands near there. `-ub 8192` costs 1.6 GiB of compute buffers over `-ub 2048` (GTT after load 76.5 GiB against 74.9).
+
+llama-server at `-np 1 -c 262144 -fa on -b 8192 -ub 8192` on IQ4_NL: an 84708-token prompt prefills at 1411 t/s average (1499 instantaneous at depth ~104k) and generates 34.7 t/s at that depth, against 760 t/s and 33.7 t/s on `-ub 512`.
+
+TG with depth, for reference only (older `-b 2048 -ub 512`, `-p 0 -n 128 -d N`, IQ4_NL): 40.45 @ d0, 37.20 @ d11425, 37.13 @ d16384, 36.23 @ d65536.
+
+Model load is 27.2-27.7 s for the 93 GiB file, at storage read rate with no repacking. Kernel-level numbers are in `hc_combine_norm_bf16.md`, `qsa_sparse_decode.md` and `qsa_pp_tg_margins.md`.
+
+GSQ-RCO-Q2_0 (61.85 GiB, 176.94 B params) was tuned before its first end-to-end run, per operator:
+- `mmb_q2_0.md`: Q2_0 stayed on MMQ in the gate. MMB loses 1.45-1.56x at the routed expert shapes and 1.14-1.26x on dense, and wins only at routed t=16384 by 5%. Its MMVQ is already the best of the types measured at the lm head (839 us against IQ4_NL's 1513 us). Q2_0 is admitted to `mmb_quant_type_routed()` (dense stays on MMQ), so the routed experts run on MMB now.
+- `mmb_bf16_weights.md`: the BF16 hyper-connection weights stay on MMB's bf16w path, 1.5-1.8x over hipBLASLt on five of six shapes. Extending the tall-M tile to BF16 was measured 29-30% slower at deep prefill and reverted.
+
+Its prefill still trails the IQ4_NL profile. Before the routed experts were gated onto MMB, their GEMMs ran on MMQ at 15.24 TFLOP/s (5.07 s of the 17.25 s pass against 4.39 s for an equivalent MMB path), and the BF16 hyper-connection projections cost 1.5 s per pass where IQ4_NL's quantized versions cost about a third of that. Those two figures are historical: the remaining known gap is the BF16 hyper-connections plus the dense mixed types (Q5_K/Q6_K/IQ4_XS/BF16), which stay on MMQ/hipBLASLt.
+
+## Roofline (measured on this machine)
+
+Machine ceilings measured with a purpose-built HIP microbenchmark, GPU clock sustained at 2.63-2.9 GHz:
+
+| resource | measured | note |
+| --- | --- | --- |
+| DRAM read | 230 GB/s | 256 theoretical. This is the hard wall for TG |
+| DRAM copy (r+w) | 205 GB/s | |
+| L2 read (4 MB set) | 654 GB/s | |
+| bf16/f16 WMMA -> f32 | 51.2 / 49.7 TFLOP/s | 95% of the 53.9 the ISA formula gives at 2.63 GHz |
+| int8 WMMA -> i32 | 50.3 TFLOP/s | the prefill MMQ engine. i8 is not faster than bf16 here |
+| int8 dot4 (dp4a) | 28.7 TFLOP/s | m=1 MMVQ path only |
+| bf16 dot2 | 19.6 TFLOP/s | |
+| fp32 FMA | 11.1 TFLOP/s | single issue. clang does not form VOPD pairs for plain FMA |
+| VALU ops next to WMMA | costly per op | measured with 2 extra ops/WMMA: 51.2 -> 45.4 TFLOP/s (-11%). With 8: 40.2 (-21%) |
+
+Workload (per token / per 16384-token pass, IQ4_NL geometry, same shapes in both models):
+
+| item | value |
+| --- | --- |
+| active params/token | 6.671 B (2.36 B routed experts, 3.49 B dense, 0.82 B lm head) |
+| FLOPs | 13.34 GFLOP/token, 191.6 TFLOP/pass (lm head counted once per pass) |
+| weight bytes | 4.25 GB/token, 70.9 GB/pass (all experts are read with 16384 tokens) |
+| residual stream | hc=4 -> 10240 wide, F32, 671 MB per full-tensor touch at 16384 tokens |
+
+Roofline results:
+- PP16384: GEMM engine bound 5.5-6.3 s (191.6 TFLOP at the best measured engine rate 30.5-35 TFLOP/s), activation-traffic bound ~3.9 s (~0.9 TB at 230 GB/s, largely not overlappable with compute in separate kernels), serial bound ~8.3 s = 1970 t/s, overlapped bound ~6.3 s = 2600 t/s, stated WMMA-peak floor 3.74 s = 4400 t/s. Measured 10.7 s = 1531.9 t/s, 78% of the serial bound. Intensity is 190 FLOP/byte, i.e. right at the machine knee (223 FLOP/byte), so both sides must move.
+- TG128 @ d0: 4.25 GB/token at 230 GB/s = 18.5 ms = 54 t/s hard bound. Measured 24.65 ms = 40.6 t/s, 75%. The weight-reading kernels already run at ~200 GB/s, so the recoverable part is the ~6.1 ms/token that is not weight traffic (copies, elementwise, quantize, F32 router GEMMs, launch count).
+- TG at long context: the dense path reads 12 layers x nk x 512 B x 2 = 1.6 GB/token of KV at 131072, plus 0.4 GB of indexer K scan, on top of 4.25 GB of weights. The sparse decode path takes over from about twelve cache cells per selected cell: it reads the 2051 selected cells (25 MB/token) instead of the cache. TG does decay with depth: measured with `-d`, 40.45 t/s at d0, 37.13 at d16384 and 36.23 at d65536 (the `tg128 @ d0` column in "Current state" is not a depth figure). The crossover is geometric, not a threshold: `indexer.top_k = 2048` with `compress_ratios = 4` on the twelve full-attention layers gives `n_sel = 2051`, so below 2051x4 = 8204 tokens the selection covers the whole context and there is nothing sparse to win. The decode kernel itself is flat in depth (148 us per row over twelve heads), and before it landed d=32768 measured 26.9 t/s against 26.6 for the dense path. What is left at depth is the indexer scan and the non-weight kernel time, not the attention.
+
+Why the GEMM engine is at 26-30 TFLOP/s: a timing experiment with the IQ4_NL dequant replaced by a trivial store gained only 11-16% (dense 27.2 -> 31.4, routed 17.4 -> 19.3 TFLOP/s). So the dequant ALU is a minor cost. The loss is operand movement and scheduling (LDS issue, fragment reload per k-step, VGPR pressure/occupancy). This matches external evidence in ~/ComfyUI-FeatherOps/docs: in a comparable gfx1151 WMMA kernel LDS was 36.8% of issued instructions, LDS cannot dual-issue with VALU, and conversion VALU hides in LDS stall slots.
+
+## Where the time goes
+
+Profile of the 13.0 s/pass tree, kept for the launch counts and the kernel ordering: the durations are rocprofv3 timestamps, which on this APU are dispatch times rather than execution times, and that pass is now 10.7 s (1531.9 t/s, "Current state"). The shares below are against a 25.2 s kernel sum: the table lists only the larger kernels, and that sum exceeds the 13.0 s wall for the same reason. Per-kernel numbers are in `attn_plan.md` (QSA, GDN), `qsa_pp_tg_margins.md` (QSA), `mmb_*.md` (MMB/MMQ/MMVQ) and `hc_combine_norm_bf16.md` (HC).
+
+| kernel | ms | share | launches |
+| --- | ---: | ---: | ---: |
+| mmb_routed_glu_kernel<64,128> (MoE gate/up) | 3494 | 13.7% | 94 |
+| mmb_dense_kernel<128,256,64,64,0> | 3256 | 12.8% | 168 |
+| qsa3_attn_kernel (sparse attention) | 1941 | 7.7% | 24 |
+| mmb_routed_kernel<128,128> (MoE down) | 1867 | 7.3% | 94 |
+| gated_delta_net_tiled_cuda | 1844 | 7.3% | 72 |
+| mmb_dense_kernel<128,128,32,64,0> | 1770 | 7.0% | 498 |
+| hc_combine_norm_f32 | 1721 | 6.8% | 190 |
+| hc_gate_mix_kernel (gate GEMM + mix) | 1064 | 4.2% | 190 |
+| mmb_dense_kernel<384,64,96,32,0> (HC down\|inject) | 946 | 3.7% | 190 |
+| lightning_indexer_kernel_tile<8,64,128,4> (indexer score) | 416 | 1.7% | 24 |
+| qsa3_rows_kernel (selection validate + sort) | 250 | 1.0% | 24 |
+| gdn_conv_direct_kernel | 612 | 2.4% | 72 |
+| mmb_f32split_kernel<128,128,32,64,true> | 576 | 2.3% | 118 |
+| mmb_dense_kernel<128,256,64,64,2> (bf16 weights) | 556 | 2.2% | 24 |
+| rms_rows_f32<true> | 427 | 1.7% | 72 |
+
+Grouped: quantized GEMMs (mmb dense/routed/glu/tall/f32split) ~13 s, QSA ~2.6 s (attention 1.9, rows 0.25, merge and pack the rest), indexer score 0.4 s, GDN ~2.5 s, hyper-connections ~2.7 s (combine+norm 1.7, gate+mix 0.9), norms ~0.9 s, elementwise, top-k, moe reduction, rope, ple and copies the rest.
+
+TG128 @ d0, IQ4_NL, per token, graphs disabled (28.3 ms of kernel time in a 37.6 ms token on that tree. The floor is 24.6 ms/token):
+
+| kernel | ms/token | share | launches/token |
+| --- | ---: | ---: | ---: |
+| mul_mat_vec_q<IQ4_NL,1> plain | 23.4 | 60.1% | 580 |
+| mul_mat_vec_q<IQ4_NL,1> split/ids | 5.2 | 13.3% | 48 |
+| mul_mat_vec_q<Q6_K,1> (lm head, attn out) | 3.1 | 8.0% | 13 |
+| mul_mat_vec_f (F32 router GEMMs) | 1.4 | 3.5% | 97 |
+| quantize_q8_1 | 0.80 | 2.1% | 670 |
+| k_get_rows_float_vec (indexer gather) | 0.57 | 1.5% | 36 |
+| mul_mat_vec_q<Q8_0,1> | 0.40 | 1.0% | 28 |
+| topk_moe_cuda | 0.39 | 1.0% | 48 |
+| gated_delta_net_cuda | 0.36 | 0.9% | 36 |
+| scale_f32 (HC control chain) | 0.31 | 0.8% | 343 |
+| hc_combine_norm_f32 | 0.30 | 0.8% | 96 |
+| mul_mat_vec_f<bf16> | 0.24 | 0.6% | 24 |
+| k_bin_bcast<op_add> | 0.18 | 0.5% | 141 |
+
+The weight kernels are 32.6 ms of the 38.9 ms kernel sum. Everything else is 6.3 ms, of which the two largest single items are the quantize pass (719 launches, one per expert per matrix, which P0-4 describes hoisting) and the indexer pool gather plus its norm/rope rebuild, which is query independent work redone every token (`qsa_pp_tg_margins.md`).
+
+Q2_0 runs the same kernel families with its own quant mix, so the IQ4_NL table above is representative of the shape of the pass and P0-1/P0-2 record what happened to the MMQ and f32split shares.
+
+Conclusion: a large share of that pass on the mixed quant recipes went through paths that the IQ4_NL-optimized code does not cover (MMQ Q2_0/Q5_K and the codebook types, hipBLASLt Q6_K, mmb_f32split for F32). Q2_0 and the codebook types route through MMB now and the F32 router tile is in, so what is left of this list is mainly the dense mixed types and the BF16 hyper-connections.
+
+## Work items, largest margin first
+
+### P0-1: Bring the mixed-model quant types onto the fast prefill path
+
+Status: done for the quick gates (Q5_K, IQ4_XS and Q6_K recipes). `mmb_quant_type_routed()` also lists IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS and IQ3_S (with hand-written grid recipes). IQ1_S and IQ1_M stay on MMQ and their further optimization belongs to P1-6.
+
+Landed, MMB against MMQ at `test-backend-ops perf -o MMB_PERF` (TFLOP/s, routed `n_mats 512, n_used 10, m 640, k 2560` at the given token count, dense `m 2560, k 2560`):
+
+| type | routed n=512 | routed n=16384 | dense n=512 | dense n=16384 | gate |
+| --- | --- | --- | --- | --- | --- |
+| Q5_K | 4.60 vs 5.25 | 17.43 vs 14.85 | 26.25 vs 24.28 | 31.22 vs 24.96 | dense always, routed from 2048 |
+| IQ4_XS | 5.88 (MMQ) | 17.62 vs 15.49 | 30.77 vs 25.67 | 27.40 vs 26.16 | dense always, routed from 2048 |
+| Q6_K | 3.64 vs 4.35 | 17.62 vs 10.98 | 27.74 vs 13.80 | 30.90 vs 17.93 | dense from 4096, routed from 2048 |
+
+The gate column is the decision. See `mmb_iq4_xs.md`, `mmb_q5_k.md` and `mmb_q6_k.md` for what `mmb_quant_type_dense()` / `mmb_quant_type_routed()` do with each of those types.
+
+End to end: IQ4_NL pp16384 flat. The tiny-M tile needed the Q6_K dense threshold (see `mmb_q6_k.md`): always-on measured 658 against 691 on the old path, from 4096 tokens it is 681-690 with the pp16384 gain kept.
+
+Earlier note (superseded for IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S, which route through MMB now): they sat at 23.5/24.6/20.4 TFLOP/s on MMQ against 10.3/7.9/7.6 on the generic MMB path, i.e. a new recipe had to be 2-3x better than the generic one just to reach parity. What remains on MMQ is IQ1_S and IQ1_M. Their share is 175 MiB of active expert weights, they are APEX-era types, and no work is planned for the two maintained models.
+
+### P0-1 follow-up: the codebook trio is deferred on purpose (historical)
+
+IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S now have hand-written recipes in `mmb_quant_type_routed()`. This log only concerns IQ1_S/IQ1_M now.
+
+An IQ1_S recipe was written and reverted (not landed). What it established, so the next attempt does not repeat it:
+- The recipe shape is right: values are `d * (2*((qh >> 12) & 7) + 1)` times `(grid_nibble + delta)` with `delta = -1 +/- 0.125` per 32-weight sub-block, one `iq1s_grid_gpu` lookup per eight weights, and one fmaf plus one `mmb_pack2` per weight. With the staged build it measured 7.47/13.73/16.81 TFLOP/s routed (512/2048/16384) and 30.68/27.35 dense, i.e. it would clear MMQ's 6.96/14.62 and 23.5/24.7 on three of the five shapes. Those numbers are invalid because correctness failed (`ERR = 3.3` on MMB_QUANT), but they say the *cost model* is fine and the bug is a mapping detail.
+- The element mapping, scale, delta and pack were each verified in isolation: with an all-zero grid index the recipe matches ggml's own `dequantize_iq1_s` plus the `mmb_quant_slice` mapping over 256 elements, 0/256 differences. What is not verified is the grid index and the nibble order, because that degenerate case makes every nibble zero.
+- In-kernel bisect: my staging + the generic loader passes 6/6, so the staging loads are fine. The recipe's own LDS write is what fails. But note that this bisect only proves the *loads* do not break anything, since the generic loader reads the weights itself.
+- Harness pitfall that cost the most time: a standalone HIP test that includes `ggml-common.h` picks a *different* `iq1s_grid_gpu` variant for host and device (the host saw entry 1829 = 0x068b2e60, the device 0x21102012), so host/device comparisons there are meaningless. Debug this type inside the real build (print the instantiated `WTYPE` and a marker in the branch, or diff the two LDS rows in-kernel), not in a copied harness.
+- Value: IQ1_S is 101 MiB of active expert weights, all on the *routed* path, so the model-level ceiling is about +1-2% pp16384 for those types and nothing for pp512 (the routed gate keeps MMQ below 2048 tokens anyway). The same recipe family would cover IQ2_XXS (113/60 MiB) and IQ2_XS, which have an extra per-8 sign LUT and a 4-bit scale. Deferred: P0-3 and P0-4 have larger margins for the same effort.
+
+Original analysis:
+
+Evidence: MMB vs MMQ measured per type at the qwen4exp shapes: IQ4_NL and Q8_0 win on MMB (1.03-1.86x), IQ1_M wins big (2.0x/5.2x), but IQ1_S, IQ2_XXS, IQ2_XS, IQ4_XS, Q4_K, Q5_K, Q6_K measured 0.18-0.70x on the generic MMB path, so the gate kept them on MMQ. The gate is split now: `mmb_quant_type_dense()` is Q8_0 and IQ4_NL, while `mmb_quant_type_routed()` lists Q2_0, Q4_K, Q5_K, Q6_K, Q5_1, Q8_0, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL and MXFP4, with the fused-gate_up exemption in `ggml_cuda_mmb_supported_mmid()`. Consequence: the routed expert weights run on MMB from `mmb_min_t()`. The dense weights other than Q8_0/IQ4_NL stay on MMQ/hipBLASLt.
+
+Work:
+- Rewrite the dequant recipes that lose on MMB: the codebook types (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_*) need the 256-entry grid lookup hoisted out of the per-weight path (per k-tile, decode once into LDS in the target block layout, as `mmb_load_quant_tile` already does for some types), and the 12-bit/6-bit packed layouts of IQ1_S/IQ2_XXS need a nibble-plan that v_perm_b32 can serve. K-quants (Q4_K/Q5_K/Q6_K) need the 6-bit scale/min unpack amortized over the 256-element superblock.
+- Re-measure each type with the existing harness (`test-backend-ops perf -o MMB_PERF -p "type_a=<t>"`) and flip the gate only where MMB beats MMQ by more than a few percent on the exact shapes (m=512, m=16384 dense, routed m=640/n=16384).
+- If a type cannot be won on MMB, tune its MMQ path instead (MMQ is int8 WMMA here, ceiling 50.3 TFLOP/s. Measured Q6_K MMQ is 13.8-17.9 dense and Q5_K/Q4_K are 24-25, so there is room). Target: at least IQ4_NL-class per-shape rates for those types, i.e. +10-20% pass level. The per-type kernel benchmark is the gate.
+
+### P0-2: Fix the F32 projections
+
+Status: done. The F32 work split into three groups, and the tiny ones dominated. The numbers in this status are from before that work.
+
+The F32 MMB ops in one pass are the hyper-connection injects ([10240, 4], 96 per pass), the GDN alpha/beta ([2560, 48], 72) and the routers ([2560, 512], 48) - 226 in total. The first two ran in a 128-row tile where 75-97% of every tile is empty, with a 4-block grid at pp512, and they were about 9% of a mixed-model pp512 pass. A 16-row tile with all eight waves split over tokens keeps the weight traffic and cuts the matrix work by up to 8x. The 16-row tile improved pp512 by 6.8% and left deep prefill unchanged. The numerics are unchanged (same splits, same k order).
+
+The router measured 5.65 TFLOP/s at `[2560, 512] x T=512` (235 us per call, 11 ms per pass, 1.4%) and 12.99 TFLOP/s at T=16384 (3.3 ms per call, 159 ms per pass, about 1%) before that work. The 256x64 F32 router tile (`MMB_F32_TILE`, from the halo/strix sync. It cut the Qwen3.6 router 1422 -> 598 us per PR #172) and the tiny-M tile (`mmb_tiny_m.md`) are in now, so re-measure the router before acting on those numbers.
+
+Original analysis:
+
+Evidence: the router (`ffn_gate_inp.weight`, [2560, 512] F32) is 241 MiB in every model, read in full for every m-tile. On IQ4_NL pp16384 it costs 286 ms/pass (7.2 TFLOP/s effective) through `mmb_f32split`. In a mixed-model pp512 trace the same family was the single largest entry (24%). TG pays 1.65 ms/token for 132 launches of F32/bf16 GEMMs.
+
+Work:
+- Add a load-time shadow copy of F32 matmul weights in a WMMA-friendly format (bf16 pair split once, or Q8_0), sized 60-120 MiB for the whole model instead of 241 MiB, and keep it behind a flag.
+- Fuse the router GEMM with the top-k/routing step (the MoE top-k already exists as its own kernel) so the 512-wide output never round-trips.
+- Gate on PPL and on routing-decision agreement against the F32 baseline (the router is a selection, small weight perturbations are visible). Target: -0.25 s/pass at pp16384 and -1.5 ms/token at TG.
+
+### P0-2 follow-up: the small ops that are left are not worth fusing
+
+Measurements in a pp16384 pass (rocprofv3 kernel trace on IQ4_NL, two passes averaged):
+- `topk_moe_cuda`, 48 launches, 11 ms (0.08%). The router output is already consumed by a single fused op (`GGML_OP_TOP_K`, the topk-MoE fusion in `ggml-cuda.cu`/`topk-moe.cu`), so "fuse the router GEMM with top-k" exists upstream. The round-trip it avoids is [512, T] F32, 33.5 MB written and read, about 0.3 ms per pass. Nothing there.
+- `mmb_f32split_kernel`, 59 launches, 312 ms (2.2%), of which 48 are the router `[2560, 512]` F32 GEMM and the rest the hc injects. The router's weight traffic is 4 m-tiles x 128 t-tiles x 1.31 MB = 671 MB per router per pass, i.e. 32 GB per pass and 140 ms at 230 GB/s, which is why it measures 13 TFLOP/s and not the 28 the F32 path can reach. A BF16 *pair* shadow does not cut those bytes at all (two BF16 is the same four bytes). It only removes the in-kernel split. A single BF16 shadow halves them (about 70 ms, 0.5%) and would additionally make 4 x 655 KB of A-tiles L2 resident against a 4 MB L2, worth up to the full 140 ms (1%). Both need the routing-agreement gate the plan already asks for, because the router is a selection. Verdict: 0.5-1% is not worth an accuracy risk, so P0-2 stays closed.
+- The hc injects in that group already run the tall-M tile (`mmb_dense_kernel<384, 64, 96, 32>`, 95 launches, 516 ms).
+
+### P0-3: Cut F32 activation traffic in PP (hc stream, norms, converts)
+
+Evidence: 3.9 s/pass (27% of the pass) of elementwise/norm/hc/copy work running at ~230 GB/s, i.e. already at the DRAM bound, over ~0.9 TB: hc pre/post 225 GB, 10240-wide F32 norms 134 GB, f32->bf16 converts 146 GB, generic elementwise 85 GB, copies 50 GB. All of it is avoidable traffic: the same tensors are read and written several times per layer because each step is its own kernel.
+
+Work:
+- Fuse the RMS norm into the `dsv4_hc_pre` epilogue (the mix output is immediately normalized and scaled).
+- Fuse the f32->bf16 conversion into the producer epilogue (norm or hc kernel) so the GEMM reads bf16 directly. Drop `mmb_cvt_f32_bf16` for those edges.
+- Fuse `dsv4_hc_post` with the residual add/scale that follows it (and with the next norm if it is cheap).
+- Evaluate bf16 storage for the hc residual stream (halves 225 GB) as an explicit accuracy experiment.
+
+Target: -1.3 to -2.0 s/pass (9-14%) with no FLOP change. Accuracy gate is PPL.
+
+### P0-3 status: done
+
+All four items landed.
+
+- Fusing the norm into the hyper-connection chain: done, though not the way the plan first put it. The combine and the norm after it are one kernel now (`hc_combine_norm_f32`), one block per (stream, token), with the row that the norm needs staying in registers. See `hc_combine_norm_bf16.md`.
+- Fusing the activation conversion into the producer: done earlier, the norm writes the BF16 copy the GEMMs read, gated at 64M elements because below that the consumer reads the tensor from cache and the conversion is nearly free. `pp_bf16_activation_norm.md`.
+- Fusing the combine with the residual add/scale: it already was one op. What was left is the norm that follows, which item 1 covers.
+- BF16 storage for the residual stream: done, and it costs nothing measurable in PPL. The precision question was settled against the reference material rather than by guessing: the Transformers DeepSeek V4 boundary returns the mHC stream in the incoming dtype and only fixes the controls, Sinkhorn state and control accumulation. The no-unsloth plan lists the mHC stream tensor under BF16 activation sizes and says it avoids full FP32 hidden-stream copies. The NVFP4 stack that took everything to 4-bit did not walk the residual stream back up. Nothing found argues against it.
+
+Also done in the same area: the gate projection is fused into the stream mix, so the gate never reaches memory.
+
+End to end, the four items together moved IQ4_NL pp16384 by +13.3% in that session (deep-prefill command in "Current state"), pp512 by +8 to +15%, tg128 was unchanged, tests stayed green, and PPL at `-ub 8192` on the docs corpus was 3.4151.
+
+What is left here: BF16 `block_out` into the combine (one more producer change, another 671 MB per layer), and the 250 ms per pass of conversions below the 64M element gate.
+
+### P0-4 status: deferred to P2-7 (small margin)
+
+The item is real but the remaining margin is per-family and small (1-2%, 0.5-1%, 0.7%, see `p0_4_tg_overhead.md`), and measuring it needs a per-family wall-clock ablation rather than the profiler, which does not attribute time on this APU. Moved next to P2-7 so that long context (P1-5) is not blocked behind it.
+
+#### Original notes: 9.4 ms of 27.9 ms is not weight traffic
+
+The premise still holds (at the floor: 24.65 ms/token = 40.57 t/s, ~6.1 ms not weight traffic): 27.9 ms per token against 4.254 GB of weight bytes is 152 GB/s of a 230 GB/s ceiling, so roughly 9 ms per token was not weight traffic. The time attribution in the evidence above is not trustworthy, though, and neither is anything derived from it: on this APU `rocprofv3 --kernel-trace` timestamps are dispatch times, not execution times (0.23% "busy" over a 26 s span with the per-token period showing up as an idle gap). The dispatch *counts* are fine, the durations are not.
+
+Tried and reverted: fusing the combine's three-node control chain (288 launches per token) into the combine kernel. It fires, it is arithmetically identical, and it changes tg128 by less than the run-to-run spread (0.4% quiet, up to 3% warm). Reverted rather than kept unmeasured.
+
+See `p0_4_tg_overhead.md` for the detail and for the three candidates that are left (MoE activation quantization 1-2%, GDN conv window shift 0.5-1%, m=1 gate+mix 0.7%). The next thing this item needs is a timing method that works here - per-family wall-clock ablation, disable one family and measure tg128 - not another trace.
+
+### P1-5 status: sparse decode attention done, indexer scan left
+
+The decode kernel gathers K/V from the cache through the selected ids, splits the keys into chunks so that twelve heads are not the whole grid, and merges the partial softmax states. Kernel time is flat in depth, 148 us per query row over twelve heads at 32768 to 131072 keys against 295 / 577 / 1147 us for the dense path, and end to end at `llama-bench -p 0 -n 128 -d 65536` it measured 19.02 t/s against 17.53 without it (that is a `-d` figure. Long-context TG has not been re-measured since). The dispatch picks the dense path below twelve cache cells per selected cell, which is where the two cross. See `qsa_sparse_decode.md`.
+
+Left in this item:
+- The selection sort in the union builder (`qsa3_rows_kernel`): 818 ms per pp16384 pass then, 125 ms now (`attn_plan.md`). It validates and bitonic-sorts 2051 ids per query row because the union/merge path needs sorted rows. A one-query-per-workgroup attention would consume the ids unsorted and delete this together with the merge and the 4x union redundancy. `qsa_pp_tg_margins.md` measures that lever at ~1.4 s of the ~3.5 s pass (the kernel runs at 41% of the DRAM ceiling). The cheap intermediate is one `__syncthreads` per two chunk iterations.
+- The indexer scan at depth: the score GEMM over all blocks, the relu-sum, the top-k and the gather, plus 0.4 GB per token of cached indexer keys at 131072. This is now the largest depth-dependent cost, and it is what limits what is left of TG at long context.
+- Quantised K/V for the sparse path (int8/fp8): halves the 25 MB selection read and the prefill union traffic. The decode kernel reads the cache directly, so this needs the cache type, not the kernel, to change first.
+- The prefill path still packs all of K/V every pass, 413 GB of union traffic at 16384 tokens.
+
+### P1-6: GEMM structural work (start it after GGTensile in the torch-ggml-ops repo is stable)
+
+Evidence (re-measure before acting): with the dequant removed entirely, MMB reaches 31.4 (dense) / 19.3 (routed) TFLOP/s against a 51.2 WMMA peak, so ~40% is lost to operand movement and scheduling. FeatherOps measured LDS at 36.8% of instructions in a comparable kernel and confirmed LDS cannot dual-issue.
+
+Sources to evaluate: PR #172 (Q8_0 routed GLU register prefetch and LDS-only barriers, routed-down BF16 for every weight type, dense GEMM residual epilogue), gufo #571 (paired gate/up rows, register-resident Q8_0 SSM fragments, a tail kernel for leftovers past 128-token tiles, GDN q/k window loads in registers) and `pwilkin/mmw-port` (a dequant-to-BF16-in-LDS WMMA engine. Lower priority now that MMB covers the routed Q2_0 and codebook types).
+
+Ideas, in order of expected value:
+- Register blocking: raise WMMA work per A/B fragment load (larger TM/TN per wave, reuse the activation fragment across n-tiles) so the per-k-step LDS traffic per WMMA drops.
+- LDS layout: swizzle for conflict-free d16/b128 access, and consider keeping the weight tile resident across m-tiles when an expert's rows exceed one tile (fewer dequant and LDS stores).
+- Occupancy: check VGPR budget of the MMB kernels against the FeatherOps envelope (191 VGPR / 32 KB LDS gave them full occupancy). MMB carries many tile registers.
+- VOPD pairing: identify instruction pairs that the ISA allows to co-issue (the manual's packed-math table pairs WMMA with DOT2) and check whether the compiler forms them.
+- If hand-tuning stalls, run a Tensile/TensileLite-style search for the exact MMB shapes, as done in ~/evotensile and ~/torch-ggml-ops (the latter already generates grouped/paired MMQ forward kernels for Q2_K-Q8_0 and IQ2_S/IQ2_XXS on this ISA).
+- Optional, larger: a prepacked weight shadow for the dense tensors only (2.1 GiB -> 3.5 GiB fp8 or 7 GiB bf16) that removes the dequant from the dense GEMMs. Memory cost must be checked against the 128 GB budget and the 26.8 GiB PLE table.
+
+### P2-7: Small margins
+
+- LM head: 0.68 GB/token (16% of TG bytes). Keep it quantized. Consider a two-stage head only if it can preserve exact logits.
+- Current items (`tg_overhead.md`): MoE activation quantization 1-2% (quantize once before the sort, gather q8_1 blocks instead of F32 rows), the GDN conv window shift 0.5-1% (needs a window pointer or offset in the conv kernel, not a faster copy) and the m=1 gate+mix path 0.7% (an m=1 epilogue on the matvec). The first matches the `pwilkin/cuda-decode-fusions` q8_1 producer fusion. The others have no ready patch.
+- QSA `qsa3_rows_kernel` reads the visibility mask per entry although the ids are pre-filtered. The mask read is needed for the dense-top-k models, so it needs an op-level flag rather than removal.
+- `mul_mat_vec_q` split variant tuning for the MoE at m=1.
+
+## Measurement protocol and gates
+
+- Exclusive jobs only (`heavy-run --`), one job at a time. Always `DEBUG_HIP_GRAPH_PM4=1`.
+- Exact command set: the two llama-bench invocations in "Current state", both at `-b 8192 -ub 8192`. Those measure pp512 @ d0, tg128 @ d0 and pp16384 @ d0. Each runs its pp and tg tests as separate instances, both from an empty context. llama-server uses the same `-b 8192 -ub 8192` (with `-np 1` and `-fa on`) so its numbers are comparable. The runtime patch behind `DEBUG_HIP_GRAPH_PM4` lives in `~/rocm-systems`.
+- Batch size: `-b 8192 -ub 8192` is the standard. `-b` must be at least `-ub` (a larger `-b` is clamped away by `cparams.n_ubatch = min(n_batch, ub)`), it does not change the compute buffers, and only `-ub` costs memory. Revisit `-b 16384` when speculative decoding or MTP is enabled: one `llama_decode()` call then has to carry the draft and the verification tokens (and more than one sequence with `-np > 1`), and `-b` bounds that. No speculative path is in use today.
+- Server-side numbers are only comparable to the bench at `-np 1` and with the same `-b`/`-ub`: with `-np > 1` every slot shares the decode batch, so the per-request `print_timing` rates divide by the number of busy slots while aggregate throughput rises. The llama-server default is `-np -1`, i.e. 4 slots and a unified KV pool, so pass `-np 1` explicitly for latency work.
+- Depth is not part of the acceptance set. A depth number needs `-d N` on the instance that measures it (`-p 0 -n 128 -d N` for tg, `-p N -n 0 -d M` for pp at depth). `-p` alone never gives the tg test any depth: llama-bench builds the generation instance with `n_prompt = 0` (the `n_gen` loop in `tools/llama-bench/llama-bench.cpp`). Annotate every depth figure with the `-d` value it was measured at, and never report the tg row of a `-p` run as a depth measurement.
+- Record with every number: commit, `uname -r`, `power_dpm_force_performance_level` and the sustained `pp_dpm_sclk`. pp follows the GPU clock, tg follows DRAM and does not: re-measure the pre-change commit back to back with the candidate on the same day before calling a pp change a regression.
+- End-to-end acceptance: pp512 @ d0 and tg128 @ d0 with 3 repeats, and pp16384 @ d0 with 1 repeat, both models. Report t/s per model and the @ d0 label with it.
+- Kernel-level (preferred for iteration and required for long context): a standalone bench harness for the new kernels. `test-backend-ops perf -o MMB_PERF` and `-o MMQ_PERF` for the GEMM shapes at m=512 and m=16384. Context 2048/16384/32768/131072 for attention, indexer, and GDN.
+- Accuracy gates per model: PPL with `llama-perplexity -c 8192 -b 8192 -ub 8192 --chunks 2` must stay within run-to-run noise of the baseline (docs corpus: IQ4_NL 3.4137-3.4151, GSQ-RCO-Q2_0 3.6730). `test-backend-ops test` must stay green for every touched op. New paths behind the existing gate functions must beat the incumbent on the exact shape or stay disabled.
+- No regression: the numbers in "Current state" are the working floor. Run-to-run spread is about 0.4% on tg128 in a quiet machine state and up to 3% when the APU has been busy, so a TG change below 1% is not evidence.
+- Profile attribution must run with `GGML_CUDA_DISABLE_GRAPHS=1`: with PM4 graphs captured the profiler sees only the host launched dispatches (84 of 3566 kernels per token) and reports dispatch times, which is what made the earlier TG table read low.
+
+## Suggested order
+
+Done: P0-1 (quant coverage. Q2_0 and the codebook types route through MMB), P0-2 (F32 projections, tiny-M tile, `MMB_F32_TILE`), P0-3 (hyper-connection fusions, BF16 stream, combine+norm+inject), the QSA sparse decode (P1-5), the GDN decode-chain and rollback fusions, the MMB low-threshold gate and the flat get_rows for small rows.
+
+Open, largest margin first:
+- P1-5 remainder: the QSA group-size lever (one query per workgroup) at ~1.4 s of the ~3.5 s pp16384 pass, plus the indexer pool rebuild at depth (~400 MB/token at 131072). Numbers and the plan are in `qsa_pp_tg_margins.md` and `attn_plan.md`.
+- P1-6 (GEMM structure): the largest remaining item by absolute time. See the sources listed there.
+- P2-7 (small margins): see `tg_overhead.md`.
+
+### Port candidates
+
+Sources: `halo-box/strix-llama.cpp` PR #172 (`rdna35-perf`, open, based on an older master, so verify each item), the `pwilkin/llama.cpp` branches, and `gufo-org/gufo` (the origin of several ideas. The engine itself is not directly portable).
+
+| source | item | effect | status |
+| --- | --- | --- | --- |
+| strix PR #172 | GDN fused decode: alpha/beta hoisted before the conv CONCAT (<=8 tokens), `SCALE(view,0)` instead of GET_ROWS for the single-token step | ~10 fewer kernels per GDN layer/token. tg 51.4 -> 53.9 on Qwen3.6 | `GDN_HOIST` absent |
+| strix PR #172 | grouped verify mat-vec for multi-token `MUL_MAT_ID` | DRAM -40% for speculative verification | absent |
+| strix PR #172 | sgma at single-token decode + `MUL_MAT -> RESHAPE -> ADD` residual bias for the GDN out-projection | +1.3% tg on Qwen3.6 | sgma exists. Decode/bias variants to check |
+| strix PR #172 | `fattn-rdna35`: D=256 15-17 -> 32-33 TFLOPS, D=512 7 -> 32, q8_0 KV read directly, split-key decode at >=4096 keys, sinks/softcap | dense-decode fallback and MTP attention | base has only the older D=256 tile kernel |
+| strix PR #172 | MMB prefill leftovers: Q8_0 routed GLU prefetch, routed-down BF16 for all types, dense residual epilogue | PP | verify per item |
+| `pwilkin/cuda-decode-fusions` | q8_1 quant fused into the producer norm, residual+norm, `MUL_MAT_ID`+routing-weight mul, GDN q/k L2 pair | +4.1 / +0.8 / +0.5 / +0.5% decode, bit-identical | all absent. The first matches the current P2-7 item |
+| `pwilkin/cuda-mmvf-block-size-floor` | `mul_mat_vec_f` block-size floor for skinny K on RDNA3.5 | bf16 HC up-projection was 16.2% of decode. +4.3% decode | absent. Re-measure |
+| `pwilkin/topk-rocm-fix` | wave32-native TOP_K | indexer selection / MoE routing | absent. Compare with the current radix path |
+| `pwilkin/fix-mtp-nextn-reserve` | re-reserve the sched when nextn extraction flags change | MTP decode | absent |
+| strix `split/pr58-mtp-draft-vocab` | MMVQ over 8-column chunks for small quantized weights, GDN conv concat transpose | +5% at 3-sequence MTP | absent |
+| strix `rocm/longctx-stability` | QSA selected-key ids uint32, depth bound 1M | >262140 context | absent |
+| `pwilkin/cuda-mmq-y-tile-rounding` | `mmq_round_up` + `blocks_per_iter` assert | latent NaN for non-power-of-two nthreads | absent. No such config in the RDNA3.5 table today |
+| `pwilkin/lazy-direct-ple` | one lazy reader per context, dequant rows in graph | `-lzm on-direct` + replay | absent |
+| `pwilkin/rocm-mmap-fix` | staged H2D double-buffer | 1.45x staged transfer (load) | absent |
+
+Not applicable: `pwilkin/mmw-port` (parked. MMB covers the routed types now), gufo #622 (our `qsa-decode.cu` already consumes a precomputed `ids` list), gufo #603 (the draft-vocab subset is already in llama.cpp via `llama_mtp_draft_vocab`), and the other-model PR #172 commits (Mamba-2 SSD, LFM2 shortconv, MLA, DFlash, qwen35 host prefill).
