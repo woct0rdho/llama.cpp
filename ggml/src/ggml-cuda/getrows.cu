@@ -129,6 +129,38 @@ static __global__ void k_get_rows_float_vec(
     }
 }
 
+// The vector kernel gives every id a whole block and strides the row inside it, so when a row is a single
+// vector all but one thread of the block idle. Copy the row with every thread instead, one id per thread.
+template<typename dst_t>
+static __global__ void k_get_rows_float_vec1(
+        const dst_t * src0_ptr, const int32_t * src1_ptr, dst_t * dst_ptr,
+        const int64_t ne10,
+        const int64_t ne11, const uint3 ne12_fdv,
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+
+    for (int64_t z = blockIdx.y; z < ne11*(int64_t)ne12_fdv.z; z += gridDim.y) {
+        const int64_t i10 = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+
+        if (i10 >= ne10) {
+            continue;
+        }
+
+        const uint2 dm = fast_div_modulo((uint32_t)z, ne12_fdv);
+        const int i11 = dm.x;
+        const int i12 = dm.y;
+
+        const int i01 = src1_ptr[i10*s10 + i11*s11 + i12*s12];
+
+        *reinterpret_cast<int4 *>(dst_ptr + i10*s1 + i11*s2 + i12*s3) =
+            *reinterpret_cast<const int4 *>((const char *) src0_ptr + i01*nb01 + i11*nb02 + i12*nb03);
+    }
+}
+
 template<typename grad_t, typename dst_t>
 static __global__ void k_get_rows_back_float(
         const grad_t * __restrict__ grad, const int32_t * __restrict__ rows, dst_t * __restrict__ dst,
@@ -266,6 +298,18 @@ static void get_rows_cuda_float(
             (((uintptr_t) src0_d) % 16 == 0) && (((uintptr_t) dst_d) % 16 == 0);
 
         if (can_vec) {
+            if (ne00v == 1) {
+                const dim3 block_nums((ne10 + CUDA_GET_ROWS_BLOCK_SIZE - 1)/CUDA_GET_ROWS_BLOCK_SIZE, MIN(ne11*ne12, UINT16_MAX), 1);
+                const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{block_nums, block_dims, 0, stream};
+                ggml_cuda_kernel_launch(k_get_rows_float_vec1<dst_t>, launch_params,
+                    (const dst_t *) src0_d, src1_d, dst_d,
+                    ne10, ne11, ne12_fdv,
+                    s1, s2, s3,
+                    nb01, nb02, nb03,
+                    s10, s11, s12);
+                return;
+            }
+
             const int block_num_y = vec_block_num_y;
             const dim3 block_nums(ne10, MIN(block_num_y, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{block_nums, block_dims, 0, stream};
