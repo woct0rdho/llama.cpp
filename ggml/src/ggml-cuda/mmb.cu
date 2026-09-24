@@ -924,11 +924,22 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     cudaStream_t stream = ctx.stream();
     const int K = (int) src0->ne[0], M = (int) src0->ne[1];
     const int T = (int) (src1->ne[1] * src1->ne[2] * src1->ne[3]);
+    // Tiny output widths waste almost every row of a 128-row tile: the qwen4exp hyper-connection
+    // injects are [10240, 4] and the GDN alpha/beta are [2560, 48], read once per pass. A 16-row
+    // tile with all eight waves split over tokens keeps the weight traffic and cuts the matrix work
+    // by up to 8x. 48 rows then take three tiles instead of one.
+    const bool tiny_m = M <= 64;
+    const dim3 grid_tiny((M + 15) / 16, (T + 127) / 128);
     if (src0->type == GGML_TYPE_F32) {
-        dim3 grid((M + 127) / 128, (T + 127) / 128);
         static const bool two = true;
-        if (two) mmb_f32split_kernel<128, 128, 32, 64, true ><<<grid, MMB_NT, 0, stream>>>((const float *) src0->data, (const float *) src1->data, (float *) dst->data, M, K, T);
-        else     mmb_f32split_kernel<128, 128, 32, 64, false><<<grid, MMB_NT, 0, stream>>>((const float *) src0->data, (const float *) src1->data, (float *) dst->data, M, K, T);
+        if (tiny_m) {
+            if (two) mmb_f32split_kernel<16, 128, 16, 16, true ><<<grid_tiny, MMB_NT, 0, stream>>>((const float *) src0->data, (const float *) src1->data, (float *) dst->data, M, K, T);
+            else     mmb_f32split_kernel<16, 128, 16, 16, false><<<grid_tiny, MMB_NT, 0, stream>>>((const float *) src0->data, (const float *) src1->data, (float *) dst->data, M, K, T);
+        } else {
+            dim3 grid((M + 127) / 128, (T + 127) / 128);
+            if (two) mmb_f32split_kernel<128, 128, 32, 64, true ><<<grid, MMB_NT, 0, stream>>>((const float *) src0->data, (const float *) src1->data, (float *) dst->data, M, K, T);
+            else     mmb_f32split_kernel<128, 128, 32, 64, false><<<grid, MMB_NT, 0, stream>>>((const float *) src0->data, (const float *) src1->data, (float *) dst->data, M, K, T);
+        }
         CUDA_CHECK(cudaGetLastError()); return;
     }
     const uint16_t * xhp = mmb_bf16_activation(ctx, src1, (size_t) T * K, stream);
@@ -962,11 +973,13 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     } else if (mmb_quant_type_mm(src0->type, T)) {
         mmb_dispatch_quant(src0->type, [&](auto tag) {
             constexpr int WT = decltype(tag)::value;
-            if (big) mmb_dense_kernel<128, 256, 64, 64, WT><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
+            if (tiny_m)  mmb_dense_kernel<16, 128, 16, 16, WT><<<grid_tiny, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
+            else if (big) mmb_dense_kernel<128, 256, 64, 64, WT><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
             else     mmb_dense_kernel<128, 128, 32, 64, WT><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
         });
     } else {
-        if (big) mmb_dense_kernel<128, 256, 64, 64, 2><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
+        if (tiny_m)  mmb_dense_kernel<16, 128, 16, 16, 2><<<grid_tiny, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
+        else if (big) mmb_dense_kernel<128, 256, 64, 64, 2><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
         else     mmb_dense_kernel<128, 128, 32, 64, 2><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
     }
     CUDA_CHECK(cudaGetLastError());
