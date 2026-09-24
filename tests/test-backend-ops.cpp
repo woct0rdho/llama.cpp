@@ -9186,9 +9186,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::default_random_engine rng(0);
 
     // MMB quant coverage: the BF16 WMMA dequant path engages from 512 tokens up
-    for (ggml_type type : {GGML_TYPE_Q1_0, GGML_TYPE_Q2_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL, GGML_TYPE_MXFP4, GGML_TYPE_NVFP4}) {
+    // F32 first: the split kernel has its own tiny-M tile
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q1_0, GGML_TYPE_Q2_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL, GGML_TYPE_MXFP4, GGML_TYPE_NVFP4}) {
         test_cases.emplace_back(new test_mmb_quant_dense(type, 512, 128, 256));
         test_cases.emplace_back(new test_mmb_quant_dense(type, 513, 129, 512));
+        // tiny output widths take the 16-row tile (the qwen4exp injects are [10240, 4] and the
+        // GDN alpha/beta [2560, 48]); F32 covers its own split kernel
+        test_cases.emplace_back(new test_mmb_quant_dense(type, 512,   4, 1024));
+        test_cases.emplace_back(new test_mmb_quant_dense(type, 512,  48, 1024));
         test_cases.emplace_back(new test_mmb_quant_routed(type, 512, false));
         test_cases.emplace_back(new test_mmb_quant_routed(type, 513, true));
     }
@@ -11450,6 +11455,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int64_t t : {512, 2048, 16384}) {
             test_cases.emplace_back(new test_mmb_perf_routed(type, 512, 10, 640, t, 2560));    // MoE gate/up
         }
+    }
+    // the F32 projections of the qwen4exp models: the router [2560, 512], the GDN alpha/beta
+    // [2560, 48] and the hyper-connection inject [10240, 4]
+    for (int64_t t : {512, 16384}) {
+        test_cases.emplace_back(new test_mmb_perf_dense(GGML_TYPE_F32, 512, t, 2560));
+        test_cases.emplace_back(new test_mmb_perf_dense(GGML_TYPE_F32,  48, t, 2560));
+        test_cases.emplace_back(new test_mmb_perf_dense(GGML_TYPE_F32,   4, t, 10240));
     }
     for (ggml_type type : {GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0,
                            GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS}) {
