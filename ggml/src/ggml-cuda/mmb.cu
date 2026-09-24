@@ -81,6 +81,48 @@ __device__ __forceinline__ void mmb_dq_row36(const uint4 w0, const uint4 w1, con
     }
 }
 
+// Q5_K scale and min of sub-block J, from the 12-byte packed array that follows d and dmin.
+// The first four scales and mins are whole bytes, the last four split a byte with two 2-bit fields.
+template <int B>
+__device__ __forceinline__ uint8_t mmb_q5k_sb(const uint4 w0) {
+    const uint32_t w = B < 4 ? w0.y : (B < 8 ? w0.z : w0.w);
+    return (uint8_t)(w >> (8*(B & 3)));
+}
+
+template <int J>
+__device__ __forceinline__ void mmb_q5k_scale(const uint4 w0, const float d, const float dmin, float & dsc, float & dm) {
+    if constexpr (J < 4) {
+        dsc =  d    * (mmb_q5k_sb<J>(w0)     & 63);
+        dm  = -dmin * (mmb_q5k_sb<J + 4>(w0) & 63);
+    } else {
+        dsc =  d    * ((mmb_q5k_sb<J + 4>(w0) & 0xF) | ((mmb_q5k_sb<J - 4>(w0) >> 6) << 4));
+        dm  = -dmin * ((mmb_q5k_sb<J + 4>(w0) >> 4)  | ((mmb_q5k_sb<J>(w0)     >> 6) << 4));
+    }
+}
+
+// dequantize one 64-element k-tile of a Q5_K row into 64 bf16 in LDS. A 256-block splits into four
+// tiles; each tile covers two 32-weight sub-blocks and carries the low nibbles of qs plus the fifth
+// bit from qh. IL is the tile index within the block, so every shift and byte offset is constant.
+template <int IL>
+__device__ __forceinline__ void mmb_dq_row_q5k(const uint4 w0, const uint4 w1, const uint4 w2, const uint4 w3, const uint4 w4,
+        uint32_t * arow) {
+    const float d = mmb_h2f((uint16_t)(w0.x & 0xffff)), dmin = mmb_h2f((uint16_t)(w0.x >> 16));
+    float dsc[2], dm[2];
+    mmb_q5k_scale<2*IL + 0>(w0, d, dmin, dsc[0], dm[0]);
+    mmb_q5k_scale<2*IL + 1>(w0, d, dmin, dsc[1], dm[1]);
+    const uint32_t qh[8] = { w1.x, w1.y, w1.z, w1.w, w2.x, w2.y, w2.z, w2.w };
+    const uint32_t ql[8] = { w3.x, w3.y, w3.z, w3.w, w4.x, w4.y, w4.z, w4.w };
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const uint32_t v0 = (ql[j]        & 0x0F0F0F0Fu) | (((qh[j] >> (2*IL + 0)) & 0x01010101u) << 4);
+        const uint32_t v1 = ((ql[j] >> 4) & 0x0F0F0F0Fu) | (((qh[j] >> (2*IL + 1)) & 0x01010101u) << 4);
+        arow[2*j     ] = mmb_pack2(fmaf((float)( v0        & 0xFFu), dsc[0], dm[0]), fmaf((float)((v0 >>  8) & 0xFFu), dsc[0], dm[0]));
+        arow[2*j +  1] = mmb_pack2(fmaf((float)((v0 >> 16) & 0xFFu), dsc[0], dm[0]), fmaf((float)( v0 >> 24       ), dsc[0], dm[0]));
+        arow[2*j + 16] = mmb_pack2(fmaf((float)( v1        & 0xFFu), dsc[1], dm[1]), fmaf((float)((v1 >>  8) & 0xFFu), dsc[1], dm[1]));
+        arow[2*j + 17] = mmb_pack2(fmaf((float)((v1 >> 16) & 0xFFu), dsc[1], dm[1]), fmaf((float)( v1 >> 24       ), dsc[1], dm[1]));
+    }
+}
+
 // dequantize one weight row's two consecutive Q8_0 blocks (68 bytes: d0 qs0[32] d1 qs1[32]) into 64 bf16 in LDS
 __device__ __forceinline__ void mmb_dq_row68(const uint4 w0, const uint4 w1, const uint4 w2, const uint4 w3, const uint32_t w4, uint32_t * arow) {
     const uint32_t ws[17] = {w0.x,w0.y,w0.z,w0.w, w1.x,w1.y,w1.z,w1.w, w2.x,w2.y,w2.z,w2.w, w3.x,w3.y,w3.z,w3.w, w4};
@@ -156,6 +198,15 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
                     const uint4 * p = (const uint4 *)(Wbase + (size_t)row * wrow_bytes + (size_t)ks * 48);
                     a0[i] = p[0]; a1[i] = p[1]; a3[i] = p[2];
                 }
+                else if constexpr (WTYPE == 32 + GGML_TYPE_Q5_K) {   // one 176-byte block covers four 64-element tiles
+                    const uint8_t * p = Wbase + (size_t)row * wrow_bytes + ((size_t)ks / 4) * 176;
+                    const size_t o = (size_t)(ks % 4) * 32;          // this tile's qs within the block
+                    a0[i] = *(const uint4 *)(p);                     // d, dmin, scales[12]
+                    a1[i] = *(const uint4 *)(p + 16);                // qh[0..15]
+                    a3[i] = *(const uint4 *)(p + 32);                // qh[16..31]
+                    a4[i] = *(const uint4 *)(p + 48 + o);            // qs[o..o+15]
+                    a5[i] = *(const uint4 *)(p + 64 + o);            // qs[o+16..o+31]
+                }
                 else if constexpr (WTYPE == 2) { const uint4 * p = (const uint4 *)(Wbase + (size_t)row * wrow_bytes + (size_t)ks * 128);
                     a0[i] = p[0]; a1[i] = p[1]; a3[i] = p[2]; a4[i] = p[3]; a5[i] = p[4]; a6[i] = p[5]; a7[i] = p[6]; a8[i] = p[7]; }
             } else { a0[i] = make_uint4(0,0,0,0); a1[i] = make_uint4(0,0,0,0); a3[i] = make_uint4(0,0,0,0); a4[i] = make_uint4(0,0,0,0); a5[i] = a6[i] = a7[i] = a8[i] = make_uint4(0,0,0,0); a2[i] = 0; }
@@ -167,12 +218,21 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
         }
     };
     auto store_lds = [&]() {
-        if constexpr (WTYPE >= 32 && WTYPE != 32 + GGML_TYPE_Q5_1) mmb_load_quant_tile<WTYPE, BM, MMB_LDS_STRIDE>(Wbase, wrow_bytes, a_rows, weight_ks, As);
+        if constexpr (WTYPE >= 32 && WTYPE != 32 + GGML_TYPE_Q5_1 && WTYPE != 32 + GGML_TYPE_Q5_K) mmb_load_quant_tile<WTYPE, BM, MMB_LDS_STRIDE>(Wbase, wrow_bytes, a_rows, weight_ks, As);
 #pragma unroll
         for (int i = 0; i < A_ITEMS; ++i) { const int row = tid + i * MMB_NT; if (row < BM) {
             if constexpr (WTYPE == 0) mmb_dq_row36(a0[i], a1[i], a2[i], (uint32_t *)(As + row * MMB_LDS_STRIDE));
             else if constexpr (WTYPE == 1) mmb_dq_row68(a0[i], a1[i], a3[i], a4[i], a2[i], (uint32_t *)(As + row * MMB_LDS_STRIDE));
             else if constexpr (WTYPE == 32 + GGML_TYPE_Q5_1) mmb_dq_q51_pair(a0[i], a1[i], a3[i], (uint32_t *)(As + row * MMB_LDS_STRIDE));
+            else if constexpr (WTYPE == 32 + GGML_TYPE_Q5_K) {
+                uint32_t * ar = (uint32_t *)(As + row * MMB_LDS_STRIDE);
+                switch (weight_ks & 3) {
+                    case 0: mmb_dq_row_q5k<0>(a0[i], a1[i], a3[i], a4[i], a5[i], ar); break;
+                    case 1: mmb_dq_row_q5k<1>(a0[i], a1[i], a3[i], a4[i], a5[i], ar); break;
+                    case 2: mmb_dq_row_q5k<2>(a0[i], a1[i], a3[i], a4[i], a5[i], ar); break;
+                    default: mmb_dq_row_q5k<3>(a0[i], a1[i], a3[i], a4[i], a5[i], ar); break;
+                }
+            }
             else if constexpr (WTYPE == 2) { uint4 * d = (uint4 *)(As + row * MMB_LDS_STRIDE); d[0] = a0[i]; d[1] = a1[i]; d[2] = a3[i]; d[3] = a4[i]; d[4] = a5[i]; d[5] = a6[i]; d[6] = a7[i]; d[7] = a8[i]; } } }
 #pragma unroll
         for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; *(uint4 *)(Bs + (c >> 3) * MMB_LDS_STRIDE + (c & 7) * 8) = bst[i]; }
@@ -734,7 +794,8 @@ bool ggml_cuda_mmb_supported_mm(const ggml_tensor * src0, const ggml_tensor * sr
 
 bool ggml_cuda_mmb_supported_mmid(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst) {
     if (!mmb_enabled()) return false;
-    if (!mmb_quant_type(src0->type) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32) return false;
+    if (!mmb_quant_type_mmid(src0->type, ids->ne[1]) ||
+            src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32) return false;
     if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) return false;
     const int64_t K = src0->ne[0], M = src0->ne[1], E = src0->ne[2];
     if (src0->ne[3] != 1 || K % 64 != 0 || E < 1 || E > 1024) return false;
@@ -874,7 +935,7 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
 
 bool ggml_cuda_mmb_supported_glu(const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * glu) {
     if (!mmb_enabled() || !mmb_glu() || !gw || !uw || !src1 || !ids || !glu) return false;
-    if (!mmb_quant_type(gw->type) || uw->type != gw->type) return false;
+    if (!mmb_quant_type_mmid(gw->type, ids->ne[1]) || uw->type != gw->type) return false;
     if (!ggml_are_same_shape(gw, uw) || gw->nb[1] != uw->nb[1] || gw->nb[2] != uw->nb[2]) return false;
     if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0) return false;
     if (glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu) || !glu->src[0] || !glu->src[1]) return false;
