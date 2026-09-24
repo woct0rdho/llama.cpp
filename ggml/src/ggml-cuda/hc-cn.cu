@@ -12,11 +12,13 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK, 1) hc_combine_norm_f32(
         const float *    residual,
         const uint16_t * res_in_bf16,
         const float *    block_out,
+        const uint16_t * blk16_in,
         const float *    gamma,
         float *          out_res,
         uint16_t *       res_out_bf16,
         float *          out_xn,
         uint16_t *       out_xn_bf16,
+        const bool       store_xn_f32,
         const int        n_embd,
         const float      eps) {
     __shared__ float s_sum[32];
@@ -33,7 +35,8 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK, 1) hc_combine_norm_f32(
     const uint16_t * res16 = res_in_bf16 ? res_in_bf16 + row * n_embd : nullptr;
     float *         dst   = out_res + row * n_embd;
     uint16_t *      dst16 = res_out_bf16 ? res_out_bf16 + row * n_embd : nullptr;
-    const float *   blk   = block_out + (int64_t) t * n_embd;
+    const float *   blk   = block_out ? block_out + (int64_t) t * n_embd : nullptr;
+    const uint16_t * blk16 = blk16_in ? blk16_in + (int64_t) t * n_embd : nullptr;
     const float *   g     = gamma + (int64_t) c * n_embd;
     float *         xn    = out_xn + row * n_embd;
     uint16_t *      xh    = out_xn_bf16 ? out_xn_bf16 + row * n_embd : nullptr;
@@ -45,7 +48,8 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK, 1) hc_combine_norm_f32(
         const int col = tid + k * HC_CN_BLOCK;
         xs[k] = 0.0f;
         if (col < n_embd) {
-            const float xi = blk[col] * w + (res16 ? hc_bf2f32(res16[col]) : res[col]);
+            const float b  = blk16 ? hc_bf2f32(blk16[col]) : blk[col];
+            const float xi = b * w + (res16 ? hc_bf2f32(res16[col]) : res[col]);
             if (dst16) {
                 dst16[col] = hc_f2bf32(xi);
             } else {
@@ -65,7 +69,9 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK, 1) hc_combine_norm_f32(
         const int col = tid + k * HC_CN_BLOCK;
         if (col < n_embd) {
             const float v = scale * xs[k] * g[col];
-            xn[col] = v;
+            if (store_xn_f32) {
+                xn[col] = v;
+            }
             if (xh) {
                 xh[col] = hc_f2bf32(v);
             }
@@ -89,11 +95,13 @@ void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_cu
             (const float *) args.post->data,
             (const float *) args.residual->data,
             args.res_in_bf16,
-            (const float *) args.block_out->data,
+            args.blk_in_bf16 ? nullptr : (const float *) args.block_out->data,
+            args.blk_in_bf16,
             (const float *) args.gamma->data,
             (float *) args.out_res->data,
             args.res_out_bf16,
             (float *) args.out_xn->data,
             args.out_xn_bf16,
+            args.store_xn_f32,
             (int) n_embd, args.eps);
 }
