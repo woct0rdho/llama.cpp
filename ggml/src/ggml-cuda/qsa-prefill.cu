@@ -679,6 +679,9 @@ bool ggml_cuda_flash_attn_ext_qsa_decode_supported(ggml_backend_cuda_context & c
     if (q->type!=GGML_TYPE_F32 || k->type!=GGML_TYPE_F16 || v->type!=GGML_TYPE_F16 ||
         dst->type!=GGML_TYPE_F32 || ids->type!=GGML_TYPE_I32 || m->type!=GGML_TYPE_F16) return false;
     if (q->ne[0]!=256 || k->ne[0]!=256 || v->ne[0]!=256 || v->ne[1]!=k->ne[1]) return false;
+    // one query row and up to a few: the dense flash attention path owns the shapes in between, and the
+    // packed prefill path is the one that pays for itself from many rows up (it scores a whole union with
+    // WMMA, where this kernel is scalar FMA and 4x slower per row at prefill query counts)
     if (q->ne[1] < 1 || q->ne[1] >= 128 || q->ne[3]!=1 || k->ne[3]!=1 || v->ne[3]!=1) return false;
     if (k->ne[2] <= 0 || v->ne[2] != k->ne[2] || q->ne[2] % k->ne[2] != 0 || q->ne[2]/k->ne[2] > 64) return false;
     if (k->ne[1] <= 0 || k->ne[1] > 262140) return false;
