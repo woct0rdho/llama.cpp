@@ -1,5 +1,8 @@
 #pragma once
 #include "common.cuh"
+
+// round an F32 to BF16 (nearest even), same result as mmb_cvt_f32_bf16
+__device__ __forceinline__ uint16_t mmb_f2bf(float f) { uint32_t u = __float_as_uint(f); u += 0x7fffu + ((u >> 16) & 1u); return (uint16_t)(u >> 16); }
 // Quantized-weight BF16 WMMA GEMM on gfx1151, from 512 tokens up.
 bool ggml_cuda_mmb_supported_mm  (const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
 bool ggml_cuda_mmb_supported_mmid(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst);
