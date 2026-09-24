@@ -230,8 +230,8 @@ __device__ __forceinline__ void mmb_load_quant_tile(const uint8_t * weights, siz
 }
 
 static bool mmb_quant_type(ggml_type type) {
-    // Per-type MMB vs MMQ at the qwen4exp shapes: MMB wins for IQ4_NL, Q8_0, IQ1_M, Q5_K and
-    // IQ4_XS; the codebook quants (IQ1_S/IQ2_*/IQ3_*) and the other K-quants are still 1.3-4.6x
+    // Per-type MMB vs MMQ at the qwen4exp shapes: MMB wins for IQ4_NL, Q8_0, IQ1_M, Q5_K, Q6_K and
+    // IQ4_XS; the codebook quants (IQ1_S/IQ2_*/IQ3_*) and the remaining K-quants are still 1.3-4.6x
     // faster on MMQ and stay there. MXFP4/NVFP4 use the same LUT-style dequant as IQ4_NL.
     switch (type) {
         case GGML_TYPE_IQ4_NL:
@@ -239,6 +239,7 @@ static bool mmb_quant_type(ggml_type type) {
         case GGML_TYPE_IQ1_M:
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_Q6_K:
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_NVFP4:
             return true;
@@ -252,8 +253,18 @@ static bool mmb_quant_type(ggml_type type) {
 // rows an expert sees at small batch. Measured at the qwen4exp MoE shape (n_mats 512, n_used 10,
 // m 640, k 2560): MMB 4.60/12.64/17.43 against MMQ 5.25/12.34/14.85 TFLOP/s at 512/2048/16384
 // tokens, and 26.25/31.22 against 24.28/24.96 on the dense shapes.
+// Q6_K dense weights already have a bf16 shadow path (mmb_dq_q6k_bf16_kernel), and its GEMM only
+// pays off once the token tiles are wide: measured on UD-IQ1_S pp512 658 t/s with Q6_K on MMB
+// against 691 t/s on the MMQ/hipBLASLt path, while pp16384 goes 971 -> 987. Keep the old path
+// below 4096 tokens, where the 20x4 launch grid of the [6144,2560] GDN shape leaves the machine
+// under-occupied.
+static bool mmb_quant_type_mm(ggml_type type, int64_t n_tokens) {
+    if (type == GGML_TYPE_Q6_K) return n_tokens >= 4096;
+    return mmb_quant_type(type);
+}
+
 static bool mmb_quant_type_mmid(ggml_type type, int64_t n_tokens) {
-    if (type == GGML_TYPE_Q5_K || type == GGML_TYPE_IQ4_XS) return n_tokens >= 2048;
+    if (type == GGML_TYPE_Q5_K || type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q6_K) return n_tokens >= 2048;
     return mmb_quant_type(type);
 }
 

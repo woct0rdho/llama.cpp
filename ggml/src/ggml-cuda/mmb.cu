@@ -124,6 +124,37 @@ __device__ __forceinline__ void mmb_dq_row_iq4xs(const uint32_t dm, const uint32
     }
 }
 
+// dequantize one 64-element k-tile of a Q6_K row into 64 bf16 in LDS. A 210-byte block holds 256
+// weights as two 128-element groups; a tile is one half of a group. ql carries the low nibbles,
+// qh the two high bits per weight, and a group has eight int8 scales, one per 16 weights.
+// H is the half within the group (0 = the low nibbles, 1 = the high nibbles), so the nibble pick,
+// the qh shift and the scale bytes are all constant.
+template <int H>
+__device__ __forceinline__ void mmb_dq_row_q6k(const uint4 ql0, const uint4 ql1, const uint4 ql2, const uint4 ql3,
+        const uint4 qh0, const uint4 qh1, const uint4 scw, const uint32_t d2, uint32_t * arow) {
+    const float d = mmb_h2f((uint16_t)(d2 & 0xffff));
+    const uint32_t sw = H == 0 ? scw.x : scw.y;    // this half's four int8 scales
+    float dsc[4], dm[4];
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+        dsc[s] = d * (float)(int8_t)(uint8_t)(sw >> (8*s));
+        dm[s]  = -32.0f * dsc[s];                  // q6_K codes are biased by 32
+    }
+    const uint32_t ql[16] = { ql0.x, ql0.y, ql0.z, ql0.w, ql1.x, ql1.y, ql1.z, ql1.w,
+                              ql2.x, ql2.y, ql2.z, ql2.w, ql3.x, ql3.y, ql3.z, ql3.w };
+    const uint32_t qh[8]  = { qh0.x, qh0.y, qh0.z, qh0.w, qh1.x, qh1.y, qh1.z, qh1.w };
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        const int s  = j < 8 ? 0 : 2;              // scale index offset within this half
+        const int sh = 4*H + (j < 8 ? 0 : 2);      // qh byte j&7 holds elements 4j, 32+4j, ...
+        const uint32_t v = (H == 0 ? (ql[j]        & 0x0F0F0F0Fu) : ((ql[j] >> 4) & 0x0F0F0F0Fu))
+                         | (((qh[j & 7] >> sh) & 0x03030303u) << 4);
+        const float a = dsc[s + (j & 7)/4], b = dm[s + (j & 7)/4];
+        arow[2*j     ] = mmb_pack2(fmaf((float)( v        & 0xFFu), a, b), fmaf((float)((v >>  8) & 0xFFu), a, b));
+        arow[2*j +  1] = mmb_pack2(fmaf((float)((v >> 16) & 0xFFu), a, b), fmaf((float)( v >> 24       ), a, b));
+    }
+}
+
 // Q5_K scale and min of sub-block J, from the 12-byte packed array that follows d and dmin.
 // The first four scales and mins are whole bytes, the last four split a byte with two 2-bit fields.
 template <int B>
@@ -249,6 +280,18 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
                     a3[i] = *(const uint4 *)(p + o);                 // qs[0..15]
                     a4[i] = *(const uint4 *)(p + o + 16);            // qs[16..31]
                 }
+            else if constexpr (WTYPE == 32 + GGML_TYPE_Q6_K) {   // one 210-byte block covers four 64-element tiles
+                const uint8_t * p = Wbase + (size_t)row * wrow_bytes + ((size_t)ks / 4) * 210;
+                const size_t g = (size_t)((ks % 4) / 2);         // 128-element group within the block
+                a0[i] = *(const uint4 *)(p + 64*g);              // ql[0..15]
+                a1[i] = *(const uint4 *)(p + 64*g + 16);         // ql[16..31]
+                a3[i] = *(const uint4 *)(p + 64*g + 32);         // ql[32..47]
+                a4[i] = *(const uint4 *)(p + 64*g + 48);         // ql[48..63]
+                a5[i] = *(const uint4 *)(p + 128 + 32*g);        // qh[0..15]
+                a6[i] = *(const uint4 *)(p + 128 + 32*g + 16);   // qh[16..31]
+                a7[i] = *(const uint4 *)(p + 192 + 8*g);         // this group's eight scales
+                a2[i] = *(const uint32_t *)(p + 208);            // d (last field of the block)
+            }
             else if constexpr (WTYPE == 32 + GGML_TYPE_Q5_K) {   // one 176-byte block covers four 64-element tiles
                     const uint8_t * p = Wbase + (size_t)row * wrow_bytes + ((size_t)ks / 4) * 176;
                     const size_t o = (size_t)(ks % 4) * 32;          // this tile's qs within the block
@@ -270,13 +313,18 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
     };
     auto store_lds = [&]() {
         if constexpr (WTYPE >= 32 && WTYPE != 32 + GGML_TYPE_Q5_1 && WTYPE != 32 + GGML_TYPE_Q5_K &&
-                WTYPE != 32 + GGML_TYPE_IQ4_XS) mmb_load_quant_tile<WTYPE, BM, MMB_LDS_STRIDE>(Wbase, wrow_bytes, a_rows, weight_ks, As);
+                WTYPE != 32 + GGML_TYPE_IQ4_XS && WTYPE != 32 + GGML_TYPE_Q6_K) mmb_load_quant_tile<WTYPE, BM, MMB_LDS_STRIDE>(Wbase, wrow_bytes, a_rows, weight_ks, As);
 #pragma unroll
         for (int i = 0; i < A_ITEMS; ++i) { const int row = tid + i * MMB_NT; if (row < BM) {
             if constexpr (WTYPE == 0) mmb_dq_row36(a0[i], a1[i], a2[i], (uint32_t *)(As + row * MMB_LDS_STRIDE));
             else if constexpr (WTYPE == 1) mmb_dq_row68(a0[i], a1[i], a3[i], a4[i], a2[i], (uint32_t *)(As + row * MMB_LDS_STRIDE));
             else if constexpr (WTYPE == 32 + GGML_TYPE_Q5_1) mmb_dq_q51_pair(a0[i], a1[i], a3[i], (uint32_t *)(As + row * MMB_LDS_STRIDE));
             else if constexpr (WTYPE == 32 + GGML_TYPE_IQ4_XS) mmb_dq_row_iq4xs(a2[i], a0[i].x, a3[i], a4[i], weight_ks % 4, (uint32_t *)(As + row * MMB_LDS_STRIDE));
+            else if constexpr (WTYPE == 32 + GGML_TYPE_Q6_K) {
+                uint32_t * ar = (uint32_t *)(As + row * MMB_LDS_STRIDE);
+                if (weight_ks & 1) mmb_dq_row_q6k<1>(a0[i], a1[i], a3[i], a4[i], a5[i], a6[i], a7[i], a2[i], ar);
+                else               mmb_dq_row_q6k<0>(a0[i], a1[i], a3[i], a4[i], a5[i], a6[i], a7[i], a2[i], ar);
+            }
             else if constexpr (WTYPE == 32 + GGML_TYPE_Q5_K) {
                 uint32_t * ar = (uint32_t *)(As + row * MMB_LDS_STRIDE);
                 switch (weight_ks & 3) {
@@ -831,7 +879,8 @@ uint16_t * ggml_cuda_mmb_cache_reserve(ggml_backend_cuda_context & ctx, const gg
 
 bool ggml_cuda_mmb_supported_mm(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     if (!mmb_enabled()) return false;
-    const bool quant = mmb_quant_type(src0->type);
+    const int64_t n_tokens_mm = src1->ne[1] * src1->ne[2] * src1->ne[3];
+    const bool quant = mmb_quant_type_mm(src0->type, n_tokens_mm);
     const bool bf16w = src0->type == GGML_TYPE_BF16 && mmb_bf16w();
     const bool f32w  = src0->type == GGML_TYPE_F32 && mmb_f32split();
     if (quant && src0->ne[0] % ggml_blck_size(src0->type) != 0) return false;
@@ -910,7 +959,7 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     } else if (src0->type == GGML_TYPE_Q8_0) {
         if (big) mmb_dense_kernel<128, 256, 64, 64, 1><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
         else     mmb_dense_kernel<128, 128, 32, 64, 1><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
-    } else if (mmb_quant_type(src0->type)) {
+    } else if (mmb_quant_type_mm(src0->type, T)) {
         mmb_dispatch_quant(src0->type, [&](auto tag) {
             constexpr int WT = decltype(tag)::value;
             if (big) mmb_dense_kernel<128, 256, 64, 64, WT><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
