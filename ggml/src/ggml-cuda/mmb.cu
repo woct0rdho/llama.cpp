@@ -18,7 +18,13 @@ typedef float v8f  __attribute__((ext_vector_type(8)));
 constexpr int MMB_BK = 64, MMB_NT = 256, MMB_LDS_STRIDE = MMB_BK + 8;
 
 __device__ __forceinline__ uint16_t mmb_f2bf(float f) { uint32_t u = __float_as_uint(f); u += 0x7fffu + ((u >> 16) & 1u); return (uint16_t)(u >> 16); }
-__device__ __forceinline__ uint32_t mmb_pack2(float a, float b) { return (uint32_t)mmb_f2bf(a) | ((uint32_t)mmb_f2bf(b) << 16); }
+// both roundings are needed as 32-bit values so v_perm_b32 can place the two high halves,
+// which is one instruction instead of two shifts plus an or
+__device__ __forceinline__ uint32_t mmb_rne_bf16(float f) { const uint32_t u = __float_as_uint(f); return u + 0x7fffu + ((u >> 16) & 1u); }
+__device__ __forceinline__ uint32_t mmb_pack2(float a, float b) {
+    // selector is one byte per output byte: 6,7 take the high half of a, 2,3 that of b
+    return __builtin_amdgcn_perm(mmb_rne_bf16(a), mmb_rne_bf16(b), 0x03020706u);
+}
 __constant__ int8_t mmb_kv_iq4nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
 __device__ __forceinline__ float mmb_h2f(uint16_t h) { return (float) __builtin_bit_cast(_Float16, h); }
 
