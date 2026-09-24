@@ -1,5 +1,7 @@
 #include "qsa-prefill.cuh"
 #if defined(GGML_USE_HIP)
+#include <cstdlib>
+#include <cstdio>
 #include "common.cuh"
 #include "qsa-prefill.cuh"
 #include <cstdio>
@@ -501,6 +503,222 @@ void ggml_cuda_flash_attn_ext_qsa_prefill(ggml_backend_cuda_context & ctx, ggml_
     ggml_cuda_kernel_launch(qsa3_attn_kernel, launch, (const float *) q->data, packed_k.get(), packed_v.get(),
                             m ? (const uint16_t *) m->data : nullptr, (const uint16_t *) ublk.get(), (const uint16_t *) umask.get(),
                             (const int *) ucount.get(), (float *) dst->data, layout);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+
+// Sparse decode: K and V are gathered straight from the cache through the selected cell ids, so the traffic
+// is the selection (top_k cells) and not the cache (nk cells). The prefill path cannot do this: it packs the
+// whole cache, which is worth it there because one K tile serves several query rows, and at one row per pass
+// the packing would be the entire cost.
+//
+// At one query row there are only as many (head, row) pairs as the model has heads, which is far too few
+// workgroups to reach DRAM, and the V pass has one two-byte load per key. So the keys are split into chunks
+// as well: the partial softmax state of every chunk is written out and merged by a second small kernel, and
+// both passes then have enough independent loads in flight.
+//   q    [256, n_tokens, n_head]  f32
+//   k, v [256, n_kv, n_kv_head]   f16
+//   ids  [n_sel, n_tokens]        i32, selected cells, invalid entries < 0 or >= n_kv
+//   m    [n_kv, n_tokens]         f16, additive bias in logit space, -inf for a cell that is not visible
+//   dst  [256, n_head, n_tokens]  f32
+#define QSA_DEC_MAX_N  2560
+#define QSA_DEC_NT     512
+#define QSA_DEC_CHUNK  512     // keys per split; n_sel/QSA_DEC_CHUNK splits per (head, row)
+
+__global__ __launch_bounds__(QSA_DEC_NT) void qsa_decode_kernel(
+        const char * __restrict__ qp, const char * __restrict__ kp, const char * __restrict__ vp,
+        const char * __restrict__ ip, const char * __restrict__ mp,
+        float * __restrict__ pout, float * __restrict__ pmax, float * __restrict__ pden,
+        const size_t q1, const size_t q2, const size_t k1, const size_t k2, const size_t v1, const size_t v2,
+        const size_t i1, const size_t m1, const int nk, const int ns, const float scale, const int gqa,
+        const int n_sel) {
+    const int head  = blockIdx.x;
+    const int query = blockIdx.y;
+    const int chunk = blockIdx.z;
+    const int kh    = head / gqa;
+    const int tid   = threadIdx.x;
+    const int lane  = tid & 31;
+    const int warp  = tid >> 5;
+
+    const int j0 = chunk * QSA_DEC_CHUNK;
+    const int j1 = j0 + QSA_DEC_CHUNK < ns ? j0 + QSA_DEC_CHUNK : ns;
+    const int nch = j1 > j0 ? j1 - j0 : 0;
+
+    __shared__ float s_q[256];
+    __shared__ float s_s[QSA_DEC_CHUNK];
+    __shared__ int   s_id[QSA_DEC_CHUNK];
+    __shared__ float s_red[QSA_DEC_NT / 32];
+    __shared__ float s_part[256];
+
+    const char * qrow  = qp + (size_t) query * q1 + (size_t) head * q2;
+    const char * irow  = ip + (size_t) query * i1;
+    const char * mrow  = mp + (size_t) query * m1;
+    const char * kbase = kp + (size_t) kh * k2;
+    const char * vbase = vp + (size_t) kh * v2;
+
+    for (int d = tid; d < 256; d += QSA_DEC_NT) { s_q[d] = ((const float *) qrow)[d]; }
+    __syncthreads();
+
+    // scores: one warp per key, so the key row is read as 16 bytes per lane and fully coalesced per warp
+    float qreg[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) { qreg[i] = s_q[lane * 8 + i]; }
+
+    float mx = -INFINITY;
+    for (int j = warp; j < nch; j += QSA_DEC_NT / 32) {
+        const int id = ((const int *) irow)[j0 + j];
+        const uint16_t mv = (id >= 0 && id < nk) ? ((const uint16_t *) mrow)[id] : 0xfc00u;
+        const bool valid = id >= 0 && id < nk && mv != 0xfc00u;
+        float sc = -INFINITY;
+        if (valid) {
+            const uint16_t * krow = (const uint16_t *) (kbase + (size_t) id * k1);
+            float acc = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) { acc = fmaf(qreg[i], qsa3_h2f(krow[lane * 8 + i]), acc); }
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) { acc += __shfl_xor(acc, off); }
+            sc = fmaf(acc, scale, qsa3_h2f(mv));
+            mx = fmaxf(mx, sc);
+        }
+        if (lane == 0) { s_s[j] = sc; s_id[j] = id; }
+    }
+
+    if (lane == 0) { s_red[warp] = mx; }
+    __syncthreads();
+    if (tid == 0) {
+        float m = -INFINITY;
+        for (int w = 0; w < QSA_DEC_NT / 32; ++w) { m = fmaxf(m, s_red[w]); }
+        s_red[0] = m;
+    }
+    __syncthreads();
+    const float m = s_red[0];
+
+    float sum = 0.0f;
+    for (int j = warp; j < nch; j += QSA_DEC_NT / 32) {
+        const float sc = s_s[j];
+        const float pr = sc == -INFINITY ? 0.0f : exp2f((sc - m) * QSA3_L2E);
+        if (lane == 0) { s_s[j] = pr; sum += pr; }
+    }
+    if (lane == 0) { s_red[warp] = sum; }
+    __syncthreads();
+    if (tid == 0) {
+        float l = 0.0f;
+        for (int w = 0; w < QSA_DEC_NT / 32; ++w) { l += s_red[w]; }
+        s_red[0] = l;
+    }
+    __syncthreads();
+    const float l = s_red[0];
+
+    // output: 256 threads cover the head dimension, so a V row is read as one contiguous 512 byte span
+    const int sub = tid >> 8, d = tid & 255;
+    float acc2 = 0.0f;
+    {
+        float a4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        int j = sub;
+        for (; j + 3 * (QSA_DEC_NT / 256) < nch; j += 4 * (QSA_DEC_NT / 256)) {
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const int jj = j + k * (QSA_DEC_NT / 256);
+                const float pr = s_s[jj];
+                if (pr > 0.0f) {
+                    a4[k] += pr * qsa3_h2f(*(const uint16_t *) (vbase + (size_t) s_id[jj] * v1 + (size_t) d * 2));
+                }
+            }
+        }
+#pragma unroll
+        for (int k = 0; k < 4; ++k) { acc2 += a4[k]; }
+        for (; j < nch; j += QSA_DEC_NT / 256) {
+            const float pr = s_s[j];
+            if (pr > 0.0f) {
+                acc2 += pr * qsa3_h2f(*(const uint16_t *) (vbase + (size_t) s_id[j] * v1 + (size_t) d * 2));
+            }
+        }
+    }
+    if (sub == 1) { s_part[d] = acc2; }
+    __syncthreads();
+    if (sub == 0) {
+        const size_t o = ((size_t) chunk * gridDim.x + head) * gridDim.y + query;
+        pout[o * 256 + d] = acc2 + s_part[d];
+        if (d == 0) { pmax[o] = m; pden[o] = l; }
+    }
+}
+
+// Merge the chunk partials: out = sum_c po_c * exp2((m_c - M)/ln2) / sum_c pl_c * exp2(...)
+__global__ __launch_bounds__(256) void qsa_decode_merge_kernel(
+        const float * __restrict__ pout, const float * __restrict__ pmax, const float * __restrict__ pden,
+        char * __restrict__ op, const size_t o1, const size_t o2, const int n_chunk) {
+    const int head  = blockIdx.x;
+    const int query = blockIdx.y;
+    const int d     = threadIdx.x;
+    const size_t base = ((size_t) head) * gridDim.y + query;
+
+    float M = -INFINITY;
+    for (int c = 0; c < n_chunk; ++c) { M = fmaxf(M, pmax[(size_t) c * gridDim.x * gridDim.y + base]); }
+    float acc = 0.0f, den = 0.0f;
+    if (M != -INFINITY) {
+        for (int c = 0; c < n_chunk; ++c) {
+            const size_t o = (size_t) c * gridDim.x * gridDim.y + base;
+            const float f = exp2f((pmax[o] - M) * QSA3_L2E);
+            den += pden[o] * f;
+            acc += pout[o * 256 + d] * f;
+        }
+    }
+    float * orow = (float *) (op + (size_t) query * o2 + (size_t) head * o1);
+    orow[d] = den > 0.0f ? acc / den : 0.0f;
+}
+
+bool ggml_cuda_flash_attn_ext_qsa_decode_supported(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+    static const bool disabled = getenv("GGML_CUDA_NO_QSA_DECODE") != nullptr;
+    if (disabled) return false;
+
+    const auto * q=dst->src[0], * k=dst->src[1], * v=dst->src[2], * m=dst->src[3], * ids=dst->src[5];
+    if (!q || !k || !v || !m || !ids || dst->src[4] || ggml_get_op_params_i32(dst, 4) != 0 ||
+            !GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ctx.device].cc)) return false;
+    float bias, softcap; memcpy(&bias, (const char *) dst->op_params+4, 4); memcpy(&softcap, (const char *) dst->op_params+8, 4);
+    if (bias != 0 || softcap != 0) return false;
+    if (q->type!=GGML_TYPE_F32 || k->type!=GGML_TYPE_F16 || v->type!=GGML_TYPE_F16 ||
+        dst->type!=GGML_TYPE_F32 || ids->type!=GGML_TYPE_I32 || m->type!=GGML_TYPE_F16) return false;
+    if (q->ne[0]!=256 || k->ne[0]!=256 || v->ne[0]!=256 || v->ne[1]!=k->ne[1]) return false;
+    if (q->ne[1] < 1 || q->ne[1] >= 128 || q->ne[3]!=1 || k->ne[3]!=1 || v->ne[3]!=1) return false;
+    if (k->ne[2] <= 0 || v->ne[2] != k->ne[2] || q->ne[2] % k->ne[2] != 0 || q->ne[2]/k->ne[2] > 64) return false;
+    if (k->ne[1] <= 0 || k->ne[1] > 262140) return false;
+    if (ids->ne[0] <= 0 || ids->ne[0] > QSA_DEC_MAX_N || ids->ne[1] < q->ne[1] || ids->ne[2]!=1 || ids->ne[3]!=1) return false;
+    if (m->ne[0] < k->ne[1] || m->ne[1] < q->ne[1] || m->ne[2]!=1 || m->ne[3]!=1) return false;
+    if (q->nb[0]!=4 || k->nb[0]!=2 || v->nb[0]!=2 || ids->nb[0]!=4 || m->nb[0]!=2) return false;
+    if (k->nb[1] < 512 || v->nb[1] < 512 || ids->nb[1] < (size_t) ids->ne[0]*4 || m->nb[1] < (size_t) m->ne[0]*2) return false;
+    if (!ggml_is_contiguous(dst)) return false;
+    // Measured on gfx1151 with n_sel = 2051: this kernel costs about the same at every cache length
+    // (~148 us for one query row over 12 heads) while the dense path grows with the cache (~108 us at
+    // 16384 keys, ~295 at 32768, ~1147 at 65536). The per-key cost here is around twelve times the
+    // dense one, so below that ratio the dense kernel is the better deal and this returns false.
+    if ((uint64_t) ids->ne[0] * 12 >= (uint64_t) k->ne[1]) return false;
+    return true;
+}
+
+void ggml_cuda_flash_attn_ext_qsa_decode(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const auto * q=dst->src[0], * k=dst->src[1], * v=dst->src[2], * m=dst->src[3], * ids=dst->src[5];
+    float scale; memcpy(&scale, dst->op_params, 4);
+    const int gqa = (int) (q->ne[2] / k->ne[2]);
+    const int ns  = (int) ids->ne[0];
+    const int n_chunk = (ns + QSA_DEC_CHUNK - 1) / QSA_DEC_CHUNK;
+    const size_t n_part = (size_t) n_chunk * q->ne[2] * q->ne[1];
+    ggml_cuda_pool_alloc<float> pout(ctx.pool(), n_part * 256);
+    ggml_cuda_pool_alloc<float> pmax(ctx.pool(), n_part * 2);
+
+    const dim3 grid((unsigned) q->ne[2], (unsigned) q->ne[1], (unsigned) n_chunk);
+    const ggml_cuda_kernel_launch_params launch(grid, QSA_DEC_NT, 0, ctx.stream());
+    ggml_cuda_kernel_launch(qsa_decode_kernel, launch,
+            (const char *) q->data, (const char *) k->data, (const char *) v->data,
+            (const char *) ids->data, (const char *) m->data,
+            pout.get(), pmax.get(), pmax.get() + n_part,
+            q->nb[1], q->nb[2], k->nb[1], k->nb[2], v->nb[1], v->nb[2],
+            ids->nb[1], m->nb[1],
+            (int) k->ne[1], ns, scale, gqa, (int) k->ne[1]);
+    const dim3 grid2((unsigned) q->ne[2], (unsigned) q->ne[1]);
+    const ggml_cuda_kernel_launch_params launch2(grid2, 256, 0, ctx.stream());
+    ggml_cuda_kernel_launch(qsa_decode_merge_kernel, launch2,
+            pout.get(), pmax.get(), pmax.get() + n_part, (char *) dst->data,
+            dst->nb[1], dst->nb[2], n_chunk);
     CUDA_CHECK(cudaGetLastError());
 }
 

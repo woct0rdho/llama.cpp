@@ -8077,6 +8077,13 @@ struct test_qsa_prefill : public test_case {
     }
 };
 
+// Sparse decode attention at long context: the same graph as test_qsa_prefill, but under its own op name so
+// that `perf -o QSA_DECODE` times the decode kernel at any depth without running a model.
+struct test_qsa_decode : public test_qsa_prefill {
+    test_qsa_decode(int queries, int keys, int selected) : test_qsa_prefill(queries, keys, selected) {}
+    std::string op_desc(ggml_tensor *) override { return "QSA_DECODE"; }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -11349,6 +11356,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_qsa_prefill(128,40064,2051,interleaved));
     }
     for (int q : {1,4,127}) test_cases.emplace_back(new test_qsa_prefill(q,4096,128));
+    // long context decode: one query row against a cache the selection is much smaller than, which is
+    // what the sparse decode kernel is for. The 128-query cases above stay on the packed prefill path.
+    for (int kv : {16384, 32768, 131072}) test_cases.emplace_back(new test_qsa_prefill(1,kv,2051));
+    for (int kv : {4096, 16384, 32768, 65536, 131072}) test_cases.emplace_back(new test_qsa_decode(1, kv, 2051));
+    test_cases.emplace_back(new test_qsa_decode(16, 131072, 2051));
+    test_cases.emplace_back(new test_qsa_prefill(8,131072,2051));
+    test_cases.emplace_back(new test_qsa_prefill(64,131072,2051));
     test_cases.emplace_back(new test_qsa_prefill(128,4096,128,true,false,2));
     test_cases.emplace_back(new test_qsa_prefill(128,4096,128,true,false,1,4));
     test_cases.emplace_back(new test_qsa_prefill(128,4096,128,true,false,1,12,128));
@@ -11446,6 +11460,9 @@ struct test_mmvq_perf : test_mul_mat {
 
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    // sparse decode attention at the context lengths that matter, one query row (TG) and one row per stream
+    for (int kv : {4096, 16384, 32768, 65536, 131072}) test_cases.emplace_back(new test_qsa_decode(1, kv, 2051));
+    test_cases.emplace_back(new test_qsa_decode(16, 131072, 2051));
     // matvec (one token) at the LM head and at the dense attention widths
     for (ggml_type type : {GGML_TYPE_IQ4_NL, GGML_TYPE_Q6_K, GGML_TYPE_Q5_K, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ1_S}) {
         test_cases.emplace_back(new test_mmvq_perf(type, 248320, 1, 2560));   // lm head
