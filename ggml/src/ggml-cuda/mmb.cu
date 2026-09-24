@@ -81,6 +81,49 @@ __device__ __forceinline__ void mmb_dq_row36(const uint4 w0, const uint4 w1, con
     }
 }
 
+// dequantize one 64-element k-tile of an IQ4_XS row (two 32-weight sub-blocks) into 64 bf16 in LDS.
+// A sub-block scale is six bits: four low bits in scales_l, two high bits in scales_h, minus 32.
+// The LUT values are the same integers as IQ4_NL, so the byte LUT held in registers plus one fmaf
+// reproduces fl(kv * dsc) exactly: -128*dsc is a power-of-two multiple, so the fma rounds once.
+__device__ __forceinline__ void mmb_dq_row_iq4xs(const uint32_t dm, const uint32_t sl, const uint4 q0, const uint4 q1,
+        const int m, uint32_t * arow) {
+    const float dh = mmb_h2f((uint16_t)(dm & 0xffff));
+    const uint32_t sh = dm >> 16;
+    const uint32_t slm = (sl >> (8*m)) & 0xFFu;   // this tile's scales_l byte
+    const uint32_t qs[8] = { q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w };
+    const uint32_t L0 = 0x3f2d1801u, L1 = 0x766a5d4fu, L2 = 0xa6998d81u, L3 = 0xf1d9c5b5u;
+#pragma unroll
+    for (int sb = 0; sb < 2; ++sb) {
+        const uint32_t ls = ((slm >> (4*sb)) & 0xFu) | (((sh >> (4*m + 2*sb)) & 3u) << 4);
+        const float dsc = dh * (float)((int) ls - 32);
+        const float md  = -128.0f * dsc;
+        uint32_t * out = arow + 16*sb;
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            const uint32_t v = qs[4*sb + w];
+            const uint32_t nib[2] = { v & 0x0F0F0F0Fu, (v >> 4) & 0x0F0F0F0Fu };
+            float x[2][4];
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const uint32_t n = nib[h];
+                const uint32_t sel = n & 0x07070707u;
+                const uint32_t pA = __builtin_amdgcn_perm(L1, L0, sel);   // entries 0..7
+                const uint32_t pB = __builtin_amdgcn_perm(L3, L2, sel);   // entries 8..15
+                const uint32_t mk = ((n >> 3) & 0x01010101u) * 0xFFu;
+                const uint32_t u  = (pA & ~mk) | (pB & mk);
+                x[h][0] = fmaf((float)( u        & 0xFFu), dsc, md);
+                x[h][1] = fmaf((float)((u >>  8) & 0xFFu), dsc, md);
+                x[h][2] = fmaf((float)((u >> 16) & 0xFFu), dsc, md);
+                x[h][3] = fmaf((float)( u >> 24       ), dsc, md);
+            }
+            out[2*w]         = mmb_pack2(x[0][0], x[0][1]);
+            out[2*w + 1]     = mmb_pack2(x[0][2], x[0][3]);
+            out[8 + 2*w]     = mmb_pack2(x[1][0], x[1][1]);
+            out[8 + 2*w + 1] = mmb_pack2(x[1][2], x[1][3]);
+        }
+    }
+}
+
 // Q5_K scale and min of sub-block J, from the 12-byte packed array that follows d and dmin.
 // The first four scales and mins are whole bytes, the last four split a byte with two 2-bit fields.
 template <int B>
@@ -198,7 +241,15 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
                     const uint4 * p = (const uint4 *)(Wbase + (size_t)row * wrow_bytes + (size_t)ks * 48);
                     a0[i] = p[0]; a1[i] = p[1]; a3[i] = p[2];
                 }
-                else if constexpr (WTYPE == 32 + GGML_TYPE_Q5_K) {   // one 176-byte block covers four 64-element tiles
+                else if constexpr (WTYPE == 32 + GGML_TYPE_IQ4_XS) { // one 136-byte block covers four 64-element tiles
+                    const uint8_t * p = Wbase + (size_t)row * wrow_bytes + ((size_t)ks / 4) * 136;
+                    const size_t o = 8 + (size_t)(ks % 4) * 32;      // this tile's qs within the block
+                    a2[i]    = *(const uint32_t *)(p);               // d, scales_h
+                    a0[i].x  = *(const uint32_t *)(p + 4);           // scales_l[0..3]
+                    a3[i] = *(const uint4 *)(p + o);                 // qs[0..15]
+                    a4[i] = *(const uint4 *)(p + o + 16);            // qs[16..31]
+                }
+            else if constexpr (WTYPE == 32 + GGML_TYPE_Q5_K) {   // one 176-byte block covers four 64-element tiles
                     const uint8_t * p = Wbase + (size_t)row * wrow_bytes + ((size_t)ks / 4) * 176;
                     const size_t o = (size_t)(ks % 4) * 32;          // this tile's qs within the block
                     a0[i] = *(const uint4 *)(p);                     // d, dmin, scales[12]
@@ -218,12 +269,14 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
         }
     };
     auto store_lds = [&]() {
-        if constexpr (WTYPE >= 32 && WTYPE != 32 + GGML_TYPE_Q5_1 && WTYPE != 32 + GGML_TYPE_Q5_K) mmb_load_quant_tile<WTYPE, BM, MMB_LDS_STRIDE>(Wbase, wrow_bytes, a_rows, weight_ks, As);
+        if constexpr (WTYPE >= 32 && WTYPE != 32 + GGML_TYPE_Q5_1 && WTYPE != 32 + GGML_TYPE_Q5_K &&
+                WTYPE != 32 + GGML_TYPE_IQ4_XS) mmb_load_quant_tile<WTYPE, BM, MMB_LDS_STRIDE>(Wbase, wrow_bytes, a_rows, weight_ks, As);
 #pragma unroll
         for (int i = 0; i < A_ITEMS; ++i) { const int row = tid + i * MMB_NT; if (row < BM) {
             if constexpr (WTYPE == 0) mmb_dq_row36(a0[i], a1[i], a2[i], (uint32_t *)(As + row * MMB_LDS_STRIDE));
             else if constexpr (WTYPE == 1) mmb_dq_row68(a0[i], a1[i], a3[i], a4[i], a2[i], (uint32_t *)(As + row * MMB_LDS_STRIDE));
             else if constexpr (WTYPE == 32 + GGML_TYPE_Q5_1) mmb_dq_q51_pair(a0[i], a1[i], a3[i], (uint32_t *)(As + row * MMB_LDS_STRIDE));
+            else if constexpr (WTYPE == 32 + GGML_TYPE_IQ4_XS) mmb_dq_row_iq4xs(a2[i], a0[i].x, a3[i], a4[i], weight_ks % 4, (uint32_t *)(As + row * MMB_LDS_STRIDE));
             else if constexpr (WTYPE == 32 + GGML_TYPE_Q5_K) {
                 uint32_t * ar = (uint32_t *)(As + row * MMB_LDS_STRIDE);
                 switch (weight_ks & 3) {
