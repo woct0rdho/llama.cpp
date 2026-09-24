@@ -3540,6 +3540,52 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // The HC gate projection [hc_lr -> hc*n_embd] is read only by the stream mix that follows it, so the
+    // GEMM, the sigmoid and the mix collapse into one kernel and the gate never reaches memory. This only
+    // checks the wiring: ggml_cuda_hc_gate_mix checks the shapes and declines if it cannot take the fused
+    // path, and the graph then runs as usual.
+    if (node->op == GGML_OP_MUL_MAT && ggml_cuda_mmb_gatemix() &&
+        GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+        const ggml_tensor * w  = node->src[0];
+        const ggml_tensor * lo = node->src[1];
+        if (ggml_is_quantized(w->type) && ggml_node_has_n_uses(cgraph, i, 1) && ggml_cuda_mmb_supported_mm(w, lo, node)) {
+            for (int j = i + 1; j < cgraph->n_nodes && j <= i + 8; ++j) {
+                ggml_tensor * mix = cgraph->nodes[j];
+                if (mix->op != GGML_OP_DSV4_HC_PRE) {
+                    continue;
+                }
+
+                // the mix reads the gate through a reshape; anything else means this is not our mix
+                const ggml_tensor * gate = mix->src[1];
+                while (gate != nullptr && (gate->op == GGML_OP_RESHAPE || gate->op == GGML_OP_VIEW)) {
+                    gate = gate->view_src;
+                }
+                const ggml_tensor * xn = mix->src[0];
+                if (gate != node || xn == nullptr || mix->ne[0] <= 0 || w->ne[1] % mix->ne[0] != 0 ||
+                        ggml_get_op_params_i32(mix, 1) == 0) {
+                    break;   // the mix must be the gated form, the kernel applies the sigmoid
+                }
+
+                bool views_only = true;
+                for (int k = i + 1; k < j && views_only; ++k) {
+                    const enum ggml_op op = cgraph->nodes[k]->op;
+                    views_only = op == GGML_OP_RESHAPE || op == GGML_OP_VIEW;
+                }
+                if (!views_only) {
+                    break;
+                }
+
+                const int hc = (int) (w->ne[1] / mix->ne[0]);
+                if (hc >= 2 && hc <= 16 &&
+                        ggml_cuda_hc_gate_mix(*cuda_ctx, w, lo, xn, mix, hc, ggml_get_op_params_f32(mix, 0), 0.0f)) {
+                    return j - i;
+                }
+                break;
+            }
+        }
+    }
+
     if (node->op == GGML_OP_CONCAT || node->op == GGML_OP_CONT) {
         ggml_cuda_ple_conv_match pm;
         if (node->op == GGML_OP_CONCAT && ggml_cuda_ple_conv_match_at_concat(cgraph, i, pm)) { ggml_cuda_ple_conv_write_tail(*cuda_ctx, pm); return 1; }
