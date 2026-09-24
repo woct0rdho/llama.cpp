@@ -11433,8 +11433,19 @@ struct test_mmb_perf_dense : test_mul_mat {
     std::string op_desc(ggml_tensor *) override { return "MMB_PERF"; }
 };
 
+struct test_mmvq_perf : test_mul_mat {
+    test_mmvq_perf(ggml_type type, int64_t m, int64_t n, int64_t k)
+        : test_mul_mat(type, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}) {}
+    std::string op_desc(ggml_tensor *) override { return "MMVQ_PERF"; }
+};
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    // matvec (one token) at the LM head and at the dense attention widths
+    for (ggml_type type : {GGML_TYPE_IQ4_NL, GGML_TYPE_Q6_K, GGML_TYPE_Q5_K, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ1_S}) {
+        test_cases.emplace_back(new test_mmvq_perf(type, 248320, 1, 2560));   // lm head
+        test_cases.emplace_back(new test_mmvq_perf(type,  10240, 1, 2560));   // dense projection
+    }
     for (ggml_type type : {GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS}) {
         for (int64_t t : {512, 16384}) {
             test_cases.emplace_back(new test_mmb_perf_routed(type, 512, 10, 640, t, 2560));    // MoE gate/up
