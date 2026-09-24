@@ -20,6 +20,10 @@ struct ggml_cuda_hc_combine_norm_args {
     const uint16_t *    res_in_bf16  = nullptr;
     uint16_t *          res_out_bf16 = nullptr;
     uint16_t *          out_xn_bf16  = nullptr;
+    // block_out marked BF16 by its producer, laid out densely over [T, n_embd] in the same buffer
+    const uint16_t *    blk_in_bf16  = nullptr;
+    // the consumers of the normed stream all take BF16 through out_xn_bf16, so the F32 copy is dead
+    bool                store_xn_f32 = true;
 };
 
 void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_cuda_hc_combine_norm_args & args);

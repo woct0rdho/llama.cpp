@@ -3598,6 +3598,80 @@ static int ggml_cuda_hc_producer_idx(const ggml_cgraph * cgraph, const ggml_tens
     return -1;
 }
 
+// One HC gate projection and the gated mix that consumes it, with only reshape/view nodes in between. The
+// fused kernel reads the activation from the BF16 slot, applies the sigmoid and mixes the streams, so the
+// gate never reaches memory. Pure structure: the fusion and the marking pass both go through here, so they
+// cannot disagree, and a captured graph replays the same choice.
+static bool ggml_cuda_hc_gatemix_match_at(const ggml_cgraph * cgraph, int j, int * matmul_idx, int * hc_out) {
+    const ggml_tensor * mix = cgraph->nodes[j];
+    if (mix->op != GGML_OP_DSV4_HC_PRE || ggml_get_op_params_i32(mix, 1) == 0 || mix->ne[0] <= 0 ||
+            mix->src[0] == nullptr) {
+        return false;   // only the gated form: the kernel applies the sigmoid itself
+    }
+
+    const ggml_tensor * gate = mix->src[1];
+    while (gate != nullptr && (gate->op == GGML_OP_RESHAPE || gate->op == GGML_OP_VIEW)) {
+        gate = gate->view_src;
+    }
+    const int i = ggml_cuda_hc_producer_idx(cgraph, gate);
+    if (i < 0 || i >= j || cgraph->nodes[i]->op != GGML_OP_MUL_MAT) {
+        return false;
+    }
+
+    const ggml_tensor * w  = cgraph->nodes[i]->src[0];
+    const ggml_tensor * lo = cgraph->nodes[i]->src[1];
+    if (!ggml_is_quantized(w->type) || w->ne[1] % mix->ne[0] != 0 ||
+            !ggml_node_has_n_uses(cgraph, i, 1) || !ggml_cuda_mmb_supported_mm(w, lo, cgraph->nodes[i])) {
+        return false;
+    }
+    for (int k = i + 1; k < j; ++k) {
+        const enum ggml_op op = cgraph->nodes[k]->op;
+        if (op != GGML_OP_RESHAPE && op != GGML_OP_VIEW) {
+            return false;
+        }
+    }
+    const int hc = (int) (w->ne[1] / mix->ne[0]);
+    if (hc < 2 || hc > 16) {
+        return false;
+    }
+    if (matmul_idx) *matmul_idx = i;
+    if (hc_out)     *hc_out = hc;
+    return true;
+}
+
+// The normed stream goes to the BF16 slot for every GEMM of the block. When every reader takes BF16 there
+// is no reason to write the F32 row at all, which is the largest single activation the block produces.
+static bool ggml_cuda_hc_xn16_ok(const ggml_cgraph * cgraph, const ggml_tensor * mul, int mul_idx) {
+    for (int j = mul_idx + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        for (int si = 0; si < GGML_MAX_SRC; ++si) {
+            const ggml_tensor * src = n->src[si];
+            if (src == nullptr || (src->view_src ? src->view_src : src) != mul) {
+                continue;
+            }
+            if (src->view_offs != 0) {
+                return false;   // the in-place layout is only readable at offset 0
+            }
+            if (n->op == GGML_OP_MUL_MAT) {
+                if (src != n->src[1] || !ggml_cuda_mmb_supported_mm(n->src[0], n->src[1], n)) {
+                    return false;
+                }
+            } else if (n->op == GGML_OP_MUL_MAT_ID) {
+                if (src != n->src[1] || !ggml_cuda_mmb_supported_mmid(n->src[0], n->src[1], n->src[2], n)) {
+                    return false;
+                }
+            } else if (n->op == GGML_OP_DSV4_HC_PRE) {
+                if (!ggml_cuda_hc_gatemix_match_at(cgraph, j, nullptr, nullptr)) {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 static bool ggml_cuda_hc_res16_ok(const ggml_cgraph * cgraph, const ggml_tensor * res, int producer_idx) {
     if (!ggml_cuda_mmb_res16() || producer_idx < 0 || !ggml_is_contiguous(res) || res->type != GGML_TYPE_F32) {
         return false;
@@ -3685,7 +3759,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (ggml_cuda_hc_res16_ok(cgraph, node, i)) {
                 args.res_out_bf16 = (uint16_t *) node->data;
             }
+            if (ggml_cuda_mmb_blk16() && ggml_cuda_mmb_is_bf16_only(node->src[0])) {
+                args.blk_in_bf16 = (const uint16_t *) node->src[0]->data;
+            }
             args.out_xn_bf16 = ggml_cuda_mmb_cache_reserve(*cuda_ctx, mul, (size_t) ggml_nelements(mul));
+            if (args.out_xn_bf16 != nullptr && ggml_cuda_hc_xn16_ok(cgraph, mul, k)) {
+                // every reader takes the slot, and the mark stops anything else from reading the tensor
+                args.store_xn_f32 = false;
+                ggml_cuda_mmb_mark_bf16_only(mul);
+            }
 
             ggml_cuda_op_hc_combine_norm(*cuda_ctx, args);
             return k - i;
@@ -3698,42 +3780,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // path, and the graph then runs as usual.
     if (node->op == GGML_OP_MUL_MAT && ggml_cuda_mmb_gatemix() &&
         GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
-        const ggml_tensor * w  = node->src[0];
-        const ggml_tensor * lo = node->src[1];
-        if (ggml_is_quantized(w->type) && ggml_node_has_n_uses(cgraph, i, 1) && ggml_cuda_mmb_supported_mm(w, lo, node)) {
-            for (int j = i + 1; j < cgraph->n_nodes && j <= i + 8; ++j) {
-                ggml_tensor * mix = cgraph->nodes[j];
-                if (mix->op != GGML_OP_DSV4_HC_PRE) {
-                    continue;
-                }
-
-                // the mix reads the gate through a reshape; anything else means this is not our mix
-                const ggml_tensor * gate = mix->src[1];
-                while (gate != nullptr && (gate->op == GGML_OP_RESHAPE || gate->op == GGML_OP_VIEW)) {
-                    gate = gate->view_src;
-                }
-                const ggml_tensor * xn = mix->src[0];
-                if (gate != node || xn == nullptr || mix->ne[0] <= 0 || w->ne[1] % mix->ne[0] != 0 ||
-                        ggml_get_op_params_i32(mix, 1) == 0) {
-                    break;   // the mix must be the gated form, the kernel applies the sigmoid
-                }
-
-                bool views_only = true;
-                for (int k = i + 1; k < j && views_only; ++k) {
-                    const enum ggml_op op = cgraph->nodes[k]->op;
-                    views_only = op == GGML_OP_RESHAPE || op == GGML_OP_VIEW;
-                }
-                if (!views_only) {
-                    break;
-                }
-
-                const int hc = (int) (w->ne[1] / mix->ne[0]);
-                if (hc >= 2 && hc <= 16 &&
-                        ggml_cuda_hc_gate_mix(*cuda_ctx, w, lo, xn, mix, hc, ggml_get_op_params_f32(mix, 0), 0.0f)) {
-                    return j - i;
-                }
-                break;
+        for (int j = i + 1; j < cgraph->n_nodes && j <= i + 8; ++j) {
+            if (cgraph->nodes[j]->op != GGML_OP_DSV4_HC_PRE) {
+                continue;
             }
+            int matmul_idx = -1, hc = 0;
+            ggml_tensor * mix = cgraph->nodes[j];
+            if (ggml_cuda_hc_gatemix_match_at(cgraph, j, &matmul_idx, &hc) && matmul_idx == i &&
+                    ggml_cuda_hc_gate_mix(*cuda_ctx, node->src[0], node->src[1], mix->src[0], mix, hc,
+                                          ggml_get_op_params_f32(mix, 0), 0.0f)) {
+                return j - i;
+            }
+            break;   // the first mix after this GEMM is the only candidate
         }
     }
 
@@ -4847,6 +4905,10 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
 static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
+    // the marks are rebuilt with the graph they describe: a stale one would let a producer skip the F32
+    // store for a tensor whose readers expect it
+    ggml_cuda_mmb_marks_clear();
+
     static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
 
     // resident BF16 shadows for the Q6_K LM head and, in shadow mode 1, dense IQ4_NL weights
@@ -4908,6 +4970,18 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 continue;
             }
             add_alloc_deps(i, k);
+
+            // A dense MMB GEMM can keep its result in BF16 in place instead of writing the F32 copy, which
+            // halves what the combine reads. The producer has to honour the mark and the combine has to be
+            // the only reader, otherwise the unfused op reads F32 out of a BF16 buffer and aborts.
+            const ggml_tensor * blk = cgraph->nodes[i]->src[0];
+            const int bi = ggml_cuda_hc_producer_idx(cgraph, blk);
+            if (bi >= 0 && ggml_cuda_mmb_blk16() && (blk->ne[0] & 7) == 0 && ggml_node_has_n_uses(cgraph, bi, 1)) {
+                const ggml_tensor * prod = cgraph->nodes[bi];
+                if (prod->op == GGML_OP_MUL_MAT && ggml_cuda_mmb_supported_mm(prod->src[0], prod->src[1], prod)) {
+                    ggml_cuda_mmb_mark_bf16_only(blk);
+                }
+            }
         }
     }
 
