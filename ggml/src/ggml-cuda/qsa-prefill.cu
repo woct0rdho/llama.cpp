@@ -278,15 +278,6 @@ __global__ __launch_bounds__(256) void qsa3_attn_kernel(
         }
     };
 
-    auto mask_values = [&](uint2 v, uint32_t mk) {
-        uint32_t lo = 0, hi = 0;
-        if (mk & 0x1111u) lo |= 0x0000ffffu;
-        if (mk & 0x2222u) lo |= 0xffff0000u;
-        if (mk & 0x4444u) hi |= 0x0000ffffu;
-        if (mk & 0x8888u) hi |= 0xffff0000u;
-        return make_uint2(v.x & lo, v.y & hi);
-    };
-
     uint32_t b01 = 0, b23 = 0, m01 = 0, m23 = 0;
     v16s kf[2];
     if (nchunks > 0) { load_desc(0, b01, b23, m01, m23); load_k(b01, b23, m01, m23, kf); }
@@ -306,10 +297,12 @@ __global__ __launch_bounds__(256) void qsa3_attn_kernel(
 #pragma unroll
             for (int t = 0; t < 2; ++t) {
                 const int d = 32*w + 16*t + r;
-                const uint2 v0 = mask_values(*reinterpret_cast<const uint2 *>(pvg + (size_t) kb0 * 1024 + d * 4), m01 & 0xffffu);
-                const uint2 v1 = mask_values(*reinterpret_cast<const uint2 *>(pvg + (size_t) kb1 * 1024 + d * 4), m01 >> 16);
-                const uint2 v2 = mask_values(*reinterpret_cast<const uint2 *>(pvg + (size_t) kb2 * 1024 + d * 4), m23 & 0xffffu);
-                const uint2 v3 = mask_values(*reinterpret_cast<const uint2 *>(pvg + (size_t) kb3 * 1024 + d * 4), m23 >> 16);
+                // keys the query did not select already get -inf in the score pass, so their weight is 0 and
+                // their V does not have to be masked out per element
+                const uint2 v0 = *reinterpret_cast<const uint2 *>(pvg + (size_t) kb0 * 1024 + d * 4);
+                const uint2 v1 = *reinterpret_cast<const uint2 *>(pvg + (size_t) kb1 * 1024 + d * 4);
+                const uint2 v2 = *reinterpret_cast<const uint2 *>(pvg + (size_t) kb2 * 1024 + d * 4);
+                const uint2 v3 = *reinterpret_cast<const uint2 *>(pvg + (size_t) kb3 * 1024 + d * 4);
                 vf[t] = __builtin_bit_cast(v16s, (uint2[4]){v0, v1, v2, v3});
             }
         }
