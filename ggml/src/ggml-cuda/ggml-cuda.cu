@@ -4558,6 +4558,32 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
 
     static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
 
+    if (ggml_cuda_mmb_down16()) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_cuda_moe_weighted_reduction_match match;
+            if (!ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
+                continue;
+            }
+
+            const ggml_tensor * ex = match.experts;
+            int xi = -1;
+            for (int k = 0; k < i; ++k) {
+                if (cgraph->nodes[k] == ex) { xi = k; break; }
+            }
+
+            // bf16 expert outputs halve the bytes the reduction reads, but only the reduction may see them:
+            // the fused pattern has to cover every reader, and the weights have to be the packed MMID ones
+            if (xi < 0 || ex->op != GGML_OP_MUL_MAT_ID || ex->type != GGML_TYPE_F32 ||
+                    ex->src[0]->type != GGML_TYPE_IQ4_NL ||
+                    !ggml_cuda_mmb_supported_mmid(ex->src[0], ex->src[1], ex->src[2], const_cast<ggml_tensor *>(ex)) ||
+                    !ggml_node_has_n_uses(cgraph, xi, 1) ||
+                    ex->ne[0] % 8 != 0 || ggml_nrows(ex) < 512) {
+                continue;
+            }
+
+            ggml_cuda_mmb_mark_bf16_only(ex);
+        }
+    }
     auto add_alloc_deps = [&](size_t start, size_t last_node) {
 
         for (size_t i = start; i < last_node; ++i) {

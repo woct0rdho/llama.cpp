@@ -1,6 +1,11 @@
 #include "moe-weighted-reduction.cuh"
+#include "mmb.cuh"
 
 #include <cstdint>
+
+static __device__ __forceinline__ float moe_bf16_to_f32(const uint16_t h) {
+    return __uint_as_float(((uint32_t) h) << 16);
+}
 
 static __global__ void moe_weighted_reduction_f32(const float * __restrict__ experts,
                                                   const float * __restrict__ expert_scale,
@@ -67,6 +72,45 @@ static __global__ void moe_weighted_reduction_f32_vec4(const float4 * __restrict
     dst[token * n_embd4 + col] = sum;
 }
 
+// BF16 expert outputs: the packed down-GEMM can write its result as bf16 in place, which halves the bytes
+// this reduction reads. Same arithmetic and column order as the float4 kernel.
+static __global__ void moe_weighted_reduction_bf16_vec4(const uint16_t * __restrict__ experts,
+                                                        const float * __restrict__ expert_scale,
+                                                        const float * __restrict__ weights,
+                                                        float4 * __restrict__ dst,
+                                                        const int64_t n_embd4,
+                                                        const int     n_expert_used) {
+    const int64_t token = blockIdx.x;
+    const int64_t col   = (int64_t) blockIdx.y * blockDim.x + threadIdx.x;
+    if (col >= n_embd4) {
+        return;
+    }
+
+    const uint64_t first_row   = (uint64_t) token * n_expert_used;
+    const float    first_scale = expert_scale != nullptr ? expert_scale[first_row] : 1.0f;
+    const float    first_w     = weights[first_row];
+    const ushort4  first_v     = *reinterpret_cast<const ushort4 *>(experts + first_row * n_embd4 * 4 + col * 4);
+
+    float4 sum;
+    sum.x = (moe_bf16_to_f32(first_v.x) * first_scale) * first_w;
+    sum.y = (moe_bf16_to_f32(first_v.y) * first_scale) * first_w;
+    sum.z = (moe_bf16_to_f32(first_v.z) * first_scale) * first_w;
+    sum.w = (moe_bf16_to_f32(first_v.w) * first_scale) * first_w;
+
+    for (int expert = 1; expert < n_expert_used; ++expert) {
+        const uint64_t row   = first_row + expert;
+        const float    scale = expert_scale != nullptr ? expert_scale[row] : 1.0f;
+        const float    w     = weights[row];
+        const ushort4  v     = *reinterpret_cast<const ushort4 *>(experts + row * n_embd4 * 4 + col * 4);
+        sum.x += (moe_bf16_to_f32(v.x) * scale) * w;
+        sum.y += (moe_bf16_to_f32(v.y) * scale) * w;
+        sum.z += (moe_bf16_to_f32(v.z) * scale) * w;
+        sum.w += (moe_bf16_to_f32(v.w) * scale) * w;
+    }
+
+    dst[token * n_embd4 + col] = sum;
+}
+
 static void launch_moe_weighted_reduction(const float * experts,
                                           const float * expert_scale,
                                           const float * weights,
@@ -111,6 +155,21 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
     const int64_t n_expert_used = experts->ne[1];
     const int64_t n_tokens      = experts->ne[2] * experts->ne[3];
     cudaStream_t  stream        = ctx.stream();
+
+    if (ggml_cuda_mmb_down16() && ggml_cuda_mmb_is_bf16_only(experts)) {
+        // the packed down-GEMM wrote the expert outputs as bf16 in place; read them as such
+        GGML_ASSERT(n_embd % 4 == 0);
+        constexpr int threads = 256;
+        const int64_t n_embd4 = n_embd / 4;
+        const dim3 blocks(n_tokens, (n_embd4 + threads - 1) / threads, 1);
+        moe_weighted_reduction_bf16_vec4<<<blocks, threads, 0, stream>>>(
+            (const uint16_t *) experts->data,
+            expert_scale ? (const float *) expert_scale->data : nullptr,
+            (const float *) weights->data,
+            (float4 *) dst->data, n_embd4, (int) n_expert_used);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
 
     launch_moe_weighted_reduction((const float *) experts->data,
                                   expert_scale ? (const float *) expert_scale->data : nullptr,
