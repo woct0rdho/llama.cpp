@@ -17,7 +17,6 @@ typedef short v16s __attribute__((ext_vector_type(16)));
 typedef float v8f  __attribute__((ext_vector_type(8)));
 constexpr int MMB_BK = 64, MMB_NT = 256, MMB_LDS_STRIDE = MMB_BK + 8;
 
-__device__ __forceinline__ uint16_t mmb_f2bf(float f) { uint32_t u = __float_as_uint(f); u += 0x7fffu + ((u >> 16) & 1u); return (uint16_t)(u >> 16); }
 // both roundings are needed as 32-bit values so v_perm_b32 can place the two high halves,
 // which is one instruction instead of two shifts plus an or
 __device__ __forceinline__ uint32_t mmb_rne_bf16(float f) { const uint32_t u = __float_as_uint(f); return u + 0x7fffu + ((u >> 16) & 1u); }
@@ -872,8 +871,13 @@ void ggml_cuda_mmb_release_all() {
     g_mmb_shadow_pair.clear();
     g_mmb_shadow_bytes = 0;
 }
+// A consumer that converts the activation itself reads it from cache, where the conversion costs
+// almost nothing and its stores act as a prefetch. Once the copy is far larger than L2 the
+// conversion is pure DRAM traffic, so only then does moving it into the producer pay.
+static size_t mmb_bf16_reserve_min() { return (size_t) 64 << 20; }
+
 uint16_t * ggml_cuda_mmb_cache_reserve(ggml_backend_cuda_context & ctx, const ggml_tensor * t, size_t n) {
-    if (!mmb_enabled() || ggml_nrows(t) < mmb_min_t()) return nullptr;
+    if (!mmb_enabled() || ggml_nrows(t) < mmb_min_t() || n < mmb_bf16_reserve_min()) return nullptr;
     return ggml_cuda_mmb_slot_reserve(ctx, 0, t, n);
 }
 
