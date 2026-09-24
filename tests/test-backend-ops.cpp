@@ -11451,7 +11451,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mmb_perf_routed(type, 512, 10, 640, t, 2560));    // MoE gate/up
         }
     }
-    for (ggml_type type : {GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
+    for (ggml_type type : {GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0,
+                           GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS}) {
         for (int64_t t : {512, 16384}) {
             test_cases.emplace_back(new test_mmb_perf_dense(type, 2560, t, 2560));             // dense attention-ish
         }
