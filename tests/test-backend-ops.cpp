@@ -11361,6 +11361,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int kv : {16384, 32768, 131072}) test_cases.emplace_back(new test_qsa_prefill(1,kv,2051));
     for (int kv : {4096, 16384, 32768, 65536, 131072}) test_cases.emplace_back(new test_qsa_decode(1, kv, 2051));
     test_cases.emplace_back(new test_qsa_decode(16, 131072, 2051));
+    // sparse prefill: many query rows against a selection much narrower than the cache
     test_cases.emplace_back(new test_qsa_prefill(8,131072,2051));
     test_cases.emplace_back(new test_qsa_prefill(64,131072,2051));
     test_cases.emplace_back(new test_qsa_prefill(128,4096,128,true,false,2));
@@ -11463,6 +11464,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // sparse decode attention at the context lengths that matter, one query row (TG) and one row per stream
     for (int kv : {4096, 16384, 32768, 65536, 131072}) test_cases.emplace_back(new test_qsa_decode(1, kv, 2051));
     test_cases.emplace_back(new test_qsa_decode(16, 131072, 2051));
+    // sparse prefill: many query rows against a selection much narrower than the cache
+    for (int kv : {16384, 32768, 131072}) test_cases.emplace_back(new test_qsa_prefill(4096, kv, 2051));
     // matvec (one token) at the LM head and at the dense attention widths
     for (ggml_type type : {GGML_TYPE_IQ4_NL, GGML_TYPE_Q6_K, GGML_TYPE_Q5_K, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ1_S}) {
         test_cases.emplace_back(new test_mmvq_perf(type, 248320, 1, 2560));   // lm head
