@@ -282,7 +282,30 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
     cb(xn, "hc_norm", il);
 
-    ggml_tensor * lo = build_lora_mm(w_down, xn);
+    // the down and the inject weights read the same [hc_dim, n_tokens] activation, and that read costs more
+    // than the extra weight columns: pack them into one GEMM and split the output. The concat itself is a
+    // per-pass copy of both weights, so it only pays once the activation is long enough to be the bigger half
+    const bool pack_di = inject != nullptr && loras->empty() && nt >= 2048 &&
+        ggml_is_quantized(w_down->type) && w_down->type == w_inject->type &&
+        ggml_is_matrix(w_down) && ggml_is_matrix(w_inject) &&
+        ggml_is_contiguous(w_down) && ggml_is_contiguous(w_inject) &&
+        w_down->ne[0] == w_inject->ne[0];
+
+    ggml_tensor * lo = nullptr;
+    if (pack_di) {
+        ggml_build_forward_expand(gf, xn);
+        ggml_tensor * weights = ggml_concat(ctx0, w_down, w_inject, 1);
+        cb(weights, "hc_down_inject_weights", il);
+        ggml_tensor * projected = ggml_mul_mat(ctx0, weights, xn);
+        cb(projected, "hc_down_inject", il);
+        lo = ggml_cont(ctx0, ggml_view_2d(ctx0, projected, w_down->ne[1], nt, projected->nb[1], 0));
+        *inject = ggml_cont(ctx0, ggml_view_2d(ctx0, projected, w_inject->ne[1], nt,
+                projected->nb[1], w_down->ne[1] * sizeof(float)));
+        ggml_build_forward_expand(gf, *inject);
+    } else {
+        lo = build_lora_mm(w_down, xn);
+    }
+
     lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
     ggml_tensor * gate = build_lora_mm(w_up, lo);
     cb(gate, "hc_gate", il);
@@ -312,7 +335,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     }
     cb(mixed, "hc_mixed", il);
 
-    if (inject) {
+    if (inject && !pack_di) {
         *inject = build_lora_mm(w_inject, xn);
         cb(*inject, "hc_inject", il);
     }

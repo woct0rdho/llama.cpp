@@ -1,4 +1,7 @@
 #include "mmb.cuh"
+
+#include <set>
+#include <string>
 #include "unary.cuh"
 #include <unordered_map>
 #include <map>
@@ -740,6 +743,15 @@ bool ggml_cuda_mmb_supported_mmid(const ggml_tensor * src0, const ggml_tensor * 
 }
 
 void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    if (getenv("MMB_DBG")) {
+        static std::set<std::string> seen;
+        char key[320];
+        snprintf(key, sizeof(key), "dst=%s ne=[%lld,%lld] src0=%s(%d) [%lld,%lld] src1=%s [%lld,%lld]",
+                dst->name, (long long) dst->ne[0], (long long) dst->ne[1],
+                src0->name, (int) src0->type, (long long) src0->ne[0], (long long) src0->ne[1],
+                src1->name, (long long) src1->ne[0], (long long) src1->ne[1]);
+        if (seen.insert(key).second) { fprintf(stderr, "[mmb] %s\n", key); }
+    }
     cudaStream_t stream = ctx.stream();
     const int K = (int) src0->ne[0], M = (int) src0->ne[1];
     const int T = (int) (src1->ne[1] * src1->ne[2] * src1->ne[3]);
