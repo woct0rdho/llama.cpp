@@ -336,6 +336,16 @@ static void get_rows_cuda_float(
         s10, s11, s12/*, s13*/);
 }
 
+// 32-value block variant for the get_rows 32-value path: rows that are whole
+// block_iq4_nl blocks but not whole QK_K super-blocks (e.g. PLE rows of 160).
+static __device__ __forceinline__ void dequantize_iq4_nl_pair(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_iq4_nl * x = (const block_iq4_nl *) vx + ib;
+    const uint8_t        q = x->qs[iqs];
+    const float          d = (float) x->d;
+    v.x = d * kvalues_iq4nl[q & 0x0f];
+    v.y = d * kvalues_iq4nl[q >> 4];
+}
+
 template <typename dst_t>
 static void ggml_cuda_get_rows_switch_src0_type(
         const void * src0_d, const ggml_type src0_type, const int32_t * src1_d, dst_t * dst_d,
@@ -437,8 +447,14 @@ static void ggml_cuda_get_rows_switch_src0_type(
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_IQ4_NL:
-            get_rows_cuda_kq<32, dst_t, dequantize_iq4_nl<dst_t>>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            if (ne00 % QK_K == 0) {
+                get_rows_cuda_kq<32, dst_t, dequantize_iq4_nl<dst_t>>(src0_d, src1_d, dst_d,
+                    ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            } else {
+                // rows that are whole 32-value blocks but not whole QK_K super-blocks (e.g. PLE rows of 160)
+                get_rows_cuda_q<QK4_NL, QR4_NL, dequantize_iq4_nl_pair>(src0_d, src1_d, dst_d,
+                    ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            }
             break;
         case GGML_TYPE_IQ4_XS:
             get_rows_cuda_kq<32, dst_t, dequantize_iq4_xs<dst_t>>(src0_d, src1_d, dst_d,
