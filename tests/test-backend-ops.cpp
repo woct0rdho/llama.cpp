@@ -11981,17 +11981,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // sparse prefill: many query rows against a selection much narrower than the cache
     for (int kv : {16384, 32768, 131072}) test_cases.emplace_back(new test_qsa_prefill(4096, kv, 2051));
     // matvec (one token) at the LM head and at the dense attention widths
-    for (ggml_type type : {GGML_TYPE_IQ4_NL, GGML_TYPE_Q6_K, GGML_TYPE_Q5_K, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ1_S}) {
+    for (ggml_type type : {GGML_TYPE_IQ4_NL, GGML_TYPE_Q6_K, GGML_TYPE_Q5_K, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ1_S, GGML_TYPE_Q2_0, GGML_TYPE_Q3_K}) {
         test_cases.emplace_back(new test_mmvq_perf(type, 248320, 1, 2560));   // lm head
         test_cases.emplace_back(new test_mmvq_perf(type,  10240, 1, 2560));   // dense projection
     }
     // the two MoE matvecs, which are most of the per token weight traffic
-    test_cases.emplace_back(new test_mmvq_perf(GGML_TYPE_IQ4_NL, 1280, 1, 2560));   // expert gate/up
-    test_cases.emplace_back(new test_mmvq_perf(GGML_TYPE_IQ4_NL, 2560, 1,  640));   // expert down
-    for (ggml_type type : {GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS}) {
+    for (ggml_type type : {GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_0}) {
+        test_cases.emplace_back(new test_mmvq_perf(type, 1280, 1, 2560));   // expert gate/up
+        test_cases.emplace_back(new test_mmvq_perf(type, 2560, 1,  640));   // expert down
+    }
+    for (ggml_type type : {GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_Q2_0, GGML_TYPE_Q3_K}) {
         for (int64_t t : {512, 2048, 16384}) {
             test_cases.emplace_back(new test_mmb_perf_routed(type, 512, 10, 640, t, 2560));    // MoE gate/up
         }
+    }
+    // Q2_0 crossover scan: where the routed kernel stops losing to MMQ
+    for (int64_t t : {4096, 8192}) {
+        test_cases.emplace_back(new test_mmb_perf_routed(GGML_TYPE_Q2_0, 512, 10, 640, t, 2560));
     }
     // the F32 projections of the qwen4exp models: the router [2560, 512], the GDN alpha/beta
     // [2560, 48] and the hyper-connection inject [10240, 4]
@@ -12001,10 +12007,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mmb_perf_dense(GGML_TYPE_F32,   4, t, 10240));
     }
     for (ggml_type type : {GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0,
-                           GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS}) {
+                           GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_Q2_0, GGML_TYPE_Q3_K}) {
         for (int64_t t : {512, 16384}) {
             test_cases.emplace_back(new test_mmb_perf_dense(type, 2560, t, 2560));             // dense attention-ish
         }
+    }
+    // the GSQ-RCO hyper-connection weights, BF16 in that model: [320, 10240] down and [10240, 320] up
+    for (int64_t t : {512, 2048, 16384}) {
+        test_cases.emplace_back(new test_mmb_perf_dense(GGML_TYPE_BF16,    320, t, 10240));
+        test_cases.emplace_back(new test_mmb_perf_dense(GGML_TYPE_BF16,  10240, t,   320));
     }
 
 

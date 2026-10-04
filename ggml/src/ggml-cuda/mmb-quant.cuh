@@ -231,8 +231,10 @@ __device__ __forceinline__ void mmb_load_quant_tile(const uint8_t * weights, siz
 
 static bool mmb_quant_type(ggml_type type) {
     // Per-type MMB vs MMQ at the qwen4exp shapes: MMB wins for IQ4_NL, Q8_0, IQ1_M, Q5_K, Q6_K and
-    // IQ4_XS; the codebook quants (IQ1_S/IQ2_*/IQ3_*) and the remaining K-quants are still 1.3-4.6x
-    // faster on MMQ and stay there. MXFP4/NVFP4 use the same LUT-style dequant as IQ4_NL.
+    // IQ4_XS. The codebook quants (IQ1_S/IQ2_*/IQ3_*), Q2_0 (1.14-1.26x dense, 1.45-1.56x routed)
+    // and the remaining K-quants are 1.1-4.6x faster on MMQ and stay there. MXFP4/NVFP4 use the same
+    // LUT-style dequant as IQ4_NL. The single MMB win for Q2_0, routed at 16384 tokens (+5%), is not
+    // worth a per-type threshold for one shape: see docs_gfx1151/mmb_q2_0.md.
     switch (type) {
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_Q8_0:
