@@ -12494,6 +12494,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // the qwen4exp indexer shapes: 128 wide, 4 heads, f32 pooled keys. The pool is the cache over the
+    // compress ratio, so a 131072 context is a 32768 entry pool; the bigger numbers cover the headroom.
+    // bs 1 goes through the vector kernel, bs >= 8 through the tile kernel.
+    for (int64_t kv : {4096, 32768, 131072}) {
+        test_cases.emplace_back(new test_lightning_indexer(128, 4, kv, 1, 1, 1, GGML_TYPE_F32));
+    }
+    for (int64_t kv : {8192, 32768, 131072}) {
+        test_cases.emplace_back(new test_lightning_indexer(128, 4, kv, 8, 1, 1, GGML_TYPE_F32));
+    }
+    test_cases.emplace_back(new test_lightning_indexer(128, 4, 32768, 512, 1, 1, GGML_TYPE_F32));
+
     // launch-overhead isolation: single L2_NORM launch vs batched siblings at the GDN
     // production shape (strided qkv views) -- perf-mode only, the eval list has its own
     // 2/4-wide coverage
