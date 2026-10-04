@@ -478,6 +478,8 @@ if __name__ == '__main__':
                 Qwen 3.5 stores gate/up and down factors as separate 3-D expert tensors.
                 DeepSeek-V4 stores the gate/up pair in one factor pair: its B factor
                 is concatenated on the output dimension and its A factor is shared.
+                Qwen4-Exp stores the fused pair as well and splits it for its separate
+                gate/up expert tensors, see `_split_qwen4_exp_gate_up`.
                 Other PEFT MoE adapters may flatten the expert and rank dimensions.
                 """
                 is_gate_up = ".mlp.experts.base_layer.lora_" in name
@@ -493,11 +495,17 @@ if __name__ == '__main__':
                 is_dsv4_down = self.model_arch == gguf.MODEL_ARCH.DEEPSEEK4 and (
                     name.endswith(".mlp.experts.lora_A_down.weight") or name.endswith(".mlp.experts.lora_B_down.weight")
                 )
+                is_qwen4_gate_up = self.model_arch == gguf.MODEL_ARCH.QWEN4EXP and (
+                    name.endswith(".mlp.experts.lora_A.weight") or name.endswith(".mlp.experts.lora_B.weight")
+                )
+                is_qwen4_down = self.model_arch == gguf.MODEL_ARCH.QWEN4EXP and (
+                    name.endswith(".mlp.experts.lora_A_down.weight") or name.endswith(".mlp.experts.lora_B_down.weight")
+                )
                 is_down = name.endswith(".mlp.experts.lora_A.weight") or name.endswith(".mlp.experts.lora_B.weight")
-                if is_qwen35_gate_up or is_dsv4_gate_up:
+                if is_qwen35_gate_up or is_dsv4_gate_up or is_qwen4_gate_up:
                     is_gate_up = True
                     is_down = False
-                elif is_qwen35_down or is_dsv4_down:
+                elif is_qwen35_down or is_dsv4_down or is_qwen4_down:
                     is_gate_up = False
                     is_down = True
                 if not is_gate_up and not is_down:
@@ -528,7 +536,7 @@ if __name__ == '__main__':
                     name = name.replace(".mlp.experts.base_layer.", ".mlp.experts.gate_up_proj.")
                     name = name.replace(".mlp.experts.lora_A.weight", ".mlp.experts.gate_up_proj.lora_A.weight")
                     name = name.replace(".mlp.experts.lora_B.weight", ".mlp.experts.gate_up_proj.lora_B.weight")
-                elif is_qwen35_down or is_dsv4_down:
+                elif is_qwen35_down or is_dsv4_down or is_qwen4_down:
                     name = name.replace(".mlp.experts.lora_A_down.weight", ".mlp.experts.down_proj.lora_A.weight")
                     name = name.replace(".mlp.experts.lora_B_down.weight", ".mlp.experts.down_proj.lora_B.weight")
                 elif name.endswith(".mlp.experts.lora_A.weight"):
@@ -698,7 +706,40 @@ if __name__ == '__main__':
                 yield (target + ".lora_a", lora_a)
                 yield (target + ".lora_b", lora_b)
 
+            def _split_qwen4_exp_gate_up(
+                self, name: str, bid: int, data_torch: Tensor
+            ) -> Iterable[tuple[str, Tensor]]:
+                """Split a fused gate/up expert factor pair into two separate targets.
+
+                Qwen4-Exp keeps gate and up as separate expert tensors, and the base
+                conversion splits `mlp.experts.gate_up_proj` the same way. The two
+                targets share the A factor, so only B splits, on its output dimension.
+                """
+                if not isinstance(data_torch, LoraTorchTensor):
+                    raise TypeError(f"Qwen4-Exp LoRA target {name!r} is not a factor pair")
+                lora_a, lora_b = data_torch.get_lora_A_B()
+                experts = self._num_experts()
+                hidden = int(self.hparams["hidden_size"])
+                intermediate = int(self.hparams["moe_intermediate_size"])
+                self._validate_lora_pair(name, lora_a, lora_b, (experts, 2 * intermediate, hidden))
+                gate_b, up_b = lora_b.split(intermediate, dim=1)
+                for key, part_b in (
+                    (gguf.MODEL_TENSOR.FFN_GATE_EXP, gate_b),
+                    (gguf.MODEL_TENSOR.FFN_UP_EXP, up_b),
+                ):
+                    target = self.format_tensor_name(key, bid)
+                    self._validate_lora_pair(target, lora_a, part_b, (experts, intermediate, hidden))
+                    yield (target + ".lora_a", lora_a.contiguous())
+                    yield (target + ".lora_b", part_b.contiguous())
+
             def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+                if (
+                    self.model_arch == gguf.MODEL_ARCH.QWEN4EXP
+                    and bid is not None
+                    and name.endswith(".mlp.experts.gate_up_proj.weight")
+                ):
+                    yield from self._split_qwen4_exp_gate_up(name, bid, data_torch)
+                    return
                 if self.model_arch == gguf.MODEL_ARCH.DEEPSEEK4 and bid is not None:
                     suffix = self._dsv4_layer_suffix(name, bid)
                     if suffix is not None:
