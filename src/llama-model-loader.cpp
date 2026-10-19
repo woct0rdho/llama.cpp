@@ -1776,7 +1776,13 @@ bool llama_model_loader::load_all_data(
 
     // 4 staging buffers for async uploads, each sized 1MB seems to be a good default for single NVMe drives.
     // NVMe raid configurations might require more / larger buffers.
+#if defined(_WIN32)
+    // WDDM event synchronization has a ~60 ms granularity: 1 MiB async chunks cap the load at ~16 MiB/s.
+    // Use one large pinned buffer and synchronous copies instead (see below).
+    constexpr size_t n_buffers = 1;
+#else
     constexpr size_t n_buffers = 4;
+#endif
 
     size_t alignment = 1;
     for (const auto & file : files) {
@@ -1784,7 +1790,11 @@ bool llama_model_loader::load_all_data(
     }
 
     // Buffer size: balance between memory usage and I/O efficiency
+#if defined(_WIN32)
+    const size_t buffer_size = 128 * 1024 * 1024;
+#else
     const size_t buffer_size = alignment != 1 ? LLAMA_DIRECT_IO_BUFFER_SIZE + 2 * alignment : 1 * 1024 * 1024;
+#endif
 
     std::vector<ggml_backend_buffer_t> host_buffers;
     std::vector<ggml_backend_event_t> events;
@@ -1976,7 +1986,9 @@ bool llama_model_loader::load_all_data(
                         uintptr_t ptr_dest_aligned = (reinterpret_cast<uintptr_t>(host_ptrs[buffer_idx]) + alignment - 1) & ~(alignment - 1);
 
                         // Wait for previous upload to complete before reusing buffer
+#if !defined(_WIN32)
                         ggml_backend_event_synchronize(events[buffer_idx]);
+#endif
 
                         // Read aligned chunk from file
                         file->read_raw_unsafe(reinterpret_cast<void *>(ptr_dest_aligned), read_size);
@@ -1997,9 +2009,14 @@ bool llama_model_loader::load_all_data(
                         }
 
                         // Async upload actual data to GPU
+#if defined(_WIN32)
+                        // A synchronous copy from the pinned staging buffer avoids the WDDM event wait
+                        ggml_backend_tensor_set(cur, reinterpret_cast<void *>(ptr_data), data_read, data_to_copy);
+#else
                         ggml_backend_tensor_set_async(upload_backend, cur,
                                                       reinterpret_cast<void *>(ptr_data), data_read, data_to_copy);
                         ggml_backend_event_record(events[buffer_idx], upload_backend);
+#endif
 
                         data_read += data_to_copy;
                         bytes_read += read_size;
