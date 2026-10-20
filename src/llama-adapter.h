@@ -89,3 +89,30 @@ struct llama_adapter_lora {
 
 using llama_adapter_loras = std::unordered_map<llama_adapter_lora *, float>;
 using llama_adapter_loras_ptr = std::unique_ptr<llama_adapter_loras>;
+
+//
+// llama_adapter_lora concatenation
+//
+
+// Sum of the deltas of n adapters as a single adapter, by concatenating the factors along the rank
+// axis:
+//
+//   sum_i scale_i * B_i @ A_i = [scale_1 B_1 | ... | scale_n B_n] @ [A_1 ; ... ; A_n]
+//
+// The concatenated adapter holds one entry per weight that any of the inputs defines, with a rank equal
+// to the sum of the ranks of the inputs that define it, so no weight is zero padded and no weight
+// is visited more than once by the graph. Adapters that define different weights are fine: a
+// weight only present in some of them gets the ranks of those only.
+//
+// llama.cpp scales a weight by `adapter_scale * alpha / b->ne[0]`, so the concatenated adapter stores B_i
+// multiplied by `scale_i * rank_t / alpha` with `alpha = max_t rank_t`. That keeps every weight at
+// its own `scale_i` and the concatenated adapter linear in its own adapter_scale.
+//
+// Returns nullptr when the inputs cannot be concatenated (no overlap is not an error, but a single
+// adapter or an empty list is not worth concatenating); the caller then keeps the adapters separate.
+// The result is owned by the caller and is not registered with the model.
+llama_adapter_lora * llama_adapter_lora_concat(
+        const llama_model * model,
+        const llama_adapter_lora * const * adapters,
+        const float * scales,
+        size_t n_adapters);
