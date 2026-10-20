@@ -427,6 +427,7 @@ llama_context::llama_context(
     cparams.op_offload     = params.op_offload;
     cparams.kv_unified     = params.kv_unified;
     cparams.moe_cache_size = params.moe_cache_size;
+    cparams.lora_concat    = params.lora_concat;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -1743,12 +1744,41 @@ void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_a
         return;
     }
 
-    loras.reset(new llama_adapter_loras());
+    // what the caller asked for, kept for the comparison above and as the fallback
+    loras_src.reset(new llama_adapter_loras());
 
     for (size_t i = 0; i < n_adapters; i ++) {
         if (scales[i] != 0.0f) {
-            loras->insert({adapters[i], scales[i]});
+            loras_src->insert({adapters[i], scales[i]});
         }
+    }
+
+    loras.reset(new llama_adapter_loras(*loras_src));
+
+    // with several adapters active, concatenate their factors so that a weight touched by n of them
+    // costs one pair of matmuls instead of n; the graph then sees a single adapter
+    if (cparams.lora_concat && loras_src->size() > 1) {
+        std::vector<const llama_adapter_lora *> src;
+        std::vector<float> src_scales;
+        for (const auto & it : *loras_src) {
+            src.push_back(it.first);
+            src_scales.push_back(it.second);
+        }
+
+        // the previous concatenated adapter may still be referenced by the graph of the last ubatch
+        synchronize();
+        lora_concat.reset();
+
+        llama_adapter_lora * concatenated = llama_adapter_lora_concat(&model, src.data(), src_scales.data(), src.size());
+        if (concatenated) {
+            lora_concat.reset(concatenated);
+
+            loras.reset(new llama_adapter_loras());
+            loras->insert({concatenated, 1.0f});
+        }
+    } else if (lora_concat) {
+        synchronize();
+        lora_concat.reset();
     }
 
     sched_need_reserve = true;
@@ -1757,7 +1787,11 @@ void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_a
 bool llama_context::adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
     LLAMA_LOG_DEBUG("%s: adapters = %p\n", __func__, (void *) adapters);
 
-    // Adapters with a zero scale are never added to `loras`, so also ignore them for the comparison.
+    if (!loras_src) {
+        return false;
+    }
+
+    // Adapters with a zero scale are never added to `loras_src`, so also ignore them for the comparison.
     size_t n_non_zero = 0;
 
     for (size_t i = 0; i < n_adapters; i ++) {
@@ -1766,18 +1800,14 @@ bool llama_context::adapters_lora_are_same(llama_adapter_lora ** adapters, size_
         }
         n_non_zero++;
 
-        auto it = loras->find(adapters[i]);
+        auto it = loras_src->find(adapters[i]);
 
-        if (it == loras->end() || it->second != scales[i]) {
+        if (it == loras_src->end() || it->second != scales[i]) {
             return false;
         }
     }
 
-    if (n_non_zero != loras->size()) {
-        return false;
-    }
-
-    return true;
+    return n_non_zero == loras_src->size();
 }
 
 bool llama_context::set_adapter_cvec(
@@ -4606,6 +4636,7 @@ llama_context_params llama_context_default_params() {
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,
+        /*.lora_concat                 =*/ true,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

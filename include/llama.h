@@ -428,6 +428,11 @@ extern "C" {
 
         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
 
+        // Concatenate the adapters that are active at the same time into a single adapter, so that a
+        // weight touched by n of them costs one pair of matmuls instead of n. This is exact up to the
+        // floating point summation order, but it does change the last bits of the output.
+        bool lora_concat; // (default: true)
+
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
         // currently works only with CPU execution
@@ -729,6 +734,23 @@ extern "C" {
     LLAMA_API struct llama_adapter_lora * llama_adapter_lora_init_from_file_ptr(
             struct llama_model * model,
             FILE * file);
+
+    // Concatenate n adapters into a single adapter that computes the sum of their deltas, by
+    // concatenating the factors along the rank axis:
+    //
+    //   sum_i scale_i * B_i @ A_i = [scale_1 B_1 | ... | scale_n B_n] @ [A_1 ; ... ; A_n]
+    //
+    // This is exact up to the floating point summation order. Adapters that define different weights
+    // are fine (a weight only present in some of them keeps the ranks of those only), and no weight is
+    // zero padded. A graph then costs one pair of matmuls per weight instead of one pair per adapter.
+    //
+    // The inputs are not freed: call llama_adapter_lora_free() on them afterwards if they are no
+    // longer needed. Returns nullptr on failure.
+    LLAMA_API struct llama_adapter_lora * llama_adapter_lora_concat(
+            const struct llama_model * model,
+            const struct llama_adapter_lora * const * adapters,
+            const float * scales,
+            size_t n_adapters);
 
     // Functions to access the adapter's GGUF metadata scalar values
     // - The functions return the length of the string on success, or -1 on failure

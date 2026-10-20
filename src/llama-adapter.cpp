@@ -7,6 +7,7 @@
 #include <map>
 #include <cassert>
 #include <cerrno>
+#include <cinttypes>
 #include <cstring>
 #include <sstream>
 #include <stdexcept>
@@ -459,6 +460,287 @@ llama_adapter_lora * llama_adapter_lora_init_from_file_ptr(llama_model * model, 
     }
 
     return nullptr;
+}
+
+//
+// llama_adapter_lora concatenation
+//
+
+// write n elements of a source chunk into a destination chunk, scaled by c
+static void llama_adapter_lora_concat_chunk(
+        uint8_t * dst, const uint8_t * src, ggml_type type_src, ggml_type type_dst, int64_t n, float c) {
+    if (c == 1.0f && type_src == type_dst) {
+        memcpy(dst, src, n*ggml_type_size(type_src));
+        return;
+    }
+
+    GGML_ASSERT((type_src == GGML_TYPE_F16 || type_src == GGML_TYPE_F32) &&
+                (type_dst == GGML_TYPE_F16 || type_dst == GGML_TYPE_F32));
+
+    for (int64_t i = 0; i < n; ++i) {
+        const float v = c*(type_src == GGML_TYPE_F32 ?
+            ((const float *) src)[i] : ggml_fp16_to_fp32(((const ggml_fp16_t *) src)[i]));
+
+        if (type_dst == GGML_TYPE_F32) {
+            ((float *) dst)[i] = v;
+        } else {
+            ((ggml_fp16_t *) dst)[i] = ggml_fp32_to_fp16(v);
+        }
+    }
+}
+
+// concatenate the factors of `n_adapters` adapters along their rank axis
+llama_adapter_lora * llama_adapter_lora_concat(
+        const llama_model * model,
+        const llama_adapter_lora * const * adapters,
+        const float * scales,
+        size_t n_adapters) {
+    if (!model || !adapters || !scales || n_adapters < 2) {
+        return nullptr;
+    }
+
+    // sources of every weight, in a deterministic order
+    std::map<std::string, std::vector<std::pair<size_t, const llama_adapter_lora_weight *>>> wmap;
+
+    for (size_t i = 0; i < n_adapters; ++i) {
+        if (!adapters[i]) {
+            return nullptr;
+        }
+        if (!adapters[i]->alora_invocation_tokens.empty()) {
+            // the scale of an activated aLoRA changes per request
+            LLAMA_LOG_INFO("%s: not concatenating, adapter %zu is an aLoRA\n", __func__, i);
+            return nullptr;
+        }
+        for (const auto & it : adapters[i]->ab_map) {
+            if (!it.second.a || !it.second.b) {
+                return nullptr;
+            }
+            wmap[it.first].push_back({i, &it.second});
+        }
+    }
+
+    if (wmap.empty()) {
+        return nullptr;
+    }
+
+    // the concatenated rank of a weight is the sum of the ranks of its sources, so no weight is padded;
+    // the largest of those ranks becomes the adapter alpha, see the header for the scaling
+    std::map<std::string, int64_t> rank_t;
+    int64_t alpha = 0;
+
+    for (const auto & it : wmap) {
+        int64_t r = 0;
+        for (const auto & s : it.second) {
+            r += s.second->b->ne[0];
+        }
+        if (r <= 0) {
+            return nullptr;
+        }
+        rank_t[it.first] = r;
+        alpha = std::max(alpha, r);
+    }
+
+    // the result is owned by the caller and is never registered with the model, so the model is only
+    // ever read through this pointer
+    auto * adapter = new llama_adapter_lora(const_cast<llama_model *>(model));
+    adapter->alpha = (float) alpha;
+
+    double size_mib = 0.0;
+
+    const int64_t t_start = ggml_time_us();
+    int64_t t_alloc = t_start;
+
+    try {
+        std::map<ggml_backend_buffer_type_t, ggml_context *> ctx_map;
+        auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
+            auto it = ctx_map.find(buft);
+            if (it != ctx_map.end()) {
+                return it->second;
+            }
+            ggml_init_params params = {
+                /*.mem_size   =*/ wmap.size()*2*ggml_tensor_overhead(),
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ true,
+            };
+            ggml_context * ctx = ggml_init(params);
+            if (!ctx) {
+                throw std::runtime_error("failed to allocate a LoRA concat context");
+            }
+            ctx_map[buft] = ctx;
+            adapter->ctxs.emplace_back(ctx);
+            return ctx;
+        };
+
+        // the concatenated factors: the same shape as the sources, with the rank axis widened
+        for (const auto & it : wmap) {
+            const std::string & name = it.first;
+            const auto & src = it.second;
+
+            const ggml_tensor * a0 = src[0].second->a;
+            const ggml_tensor * b0 = src[0].second->b;
+
+            ggml_type type_a = GGML_TYPE_F16;
+            ggml_type type_b = GGML_TYPE_F16;
+            for (const auto & s : src) {
+                if (s.second->a->type == GGML_TYPE_F32) {
+                    type_a = GGML_TYPE_F32;
+                }
+                if (s.second->b->type == GGML_TYPE_F32) {
+                    type_b = GGML_TYPE_F32;
+                }
+            }
+
+            // lora_a is [k, rank] / [k, rank, n_expert], lora_b is [rank, m] / [rank, m, n_expert]
+            const int64_t ne_a[GGML_MAX_DIMS] = { a0->ne[0], rank_t[name], a0->ne[2], a0->ne[3] };
+            const int64_t ne_b[GGML_MAX_DIMS] = { rank_t[name], b0->ne[1], b0->ne[2], b0->ne[3] };
+
+            ggml_context * ctx_a = ctx_for_buft(ggml_backend_buffer_get_type(a0->buffer));
+            ggml_context * ctx_b = ctx_for_buft(ggml_backend_buffer_get_type(b0->buffer));
+
+            ggml_tensor * a = ggml_new_tensor(ctx_a, type_a, ggml_n_dims(a0), ne_a);
+            ggml_tensor * b = ggml_new_tensor(ctx_b, type_b, ggml_n_dims(b0), ne_b);
+
+            const std::string suffix_a = name + ".lora_a";
+            const std::string suffix_b = name + ".lora_b";
+            ggml_set_name(a, suffix_a.c_str());
+            ggml_set_name(b, suffix_b.c_str());
+
+            adapter->ab_map[name] = llama_adapter_lora_weight(a, b);
+
+            size_mib += (ggml_nbytes(a) + ggml_nbytes(b))/1024.0/1024.0;
+        }
+
+        // allocate the concatenated tensors
+        for (auto & it : ctx_map) {
+            ggml_backend_buffer_ptr buf { ggml_backend_alloc_ctx_tensors_from_buft(it.second, it.first) };
+            if (!buf) {
+                throw std::runtime_error("failed to allocate the buffer of a concatenated LoRA adapter");
+            }
+            adapter->bufs.emplace_back(std::move(buf));
+        }
+
+        t_alloc = ggml_time_us();
+
+        // fill: assemble each concatenated factor in host memory, then upload it in one go
+        std::vector<uint8_t> host_src;
+        std::vector<uint8_t> host_a;
+        std::vector<uint8_t> host_b;
+
+        for (const auto & it : wmap) {
+            const std::string & name = it.first;
+            const auto & src = it.second;
+
+            llama_adapter_lora_weight & dst = adapter->ab_map[name];
+
+            const int64_t r_all = rank_t[name];
+
+            // every element below is overwritten by one of the sources, so no zero fill
+            if (host_a.size() < ggml_nbytes(dst.a)) {
+                host_a.resize(ggml_nbytes(dst.a));
+            }
+            if (host_b.size() < ggml_nbytes(dst.b)) {
+                host_b.resize(ggml_nbytes(dst.b));
+            }
+
+            int64_t r_off = 0;
+            for (const auto & s : src) {
+                const float c = scales[s.first]*(float) r_all/(float) alpha;
+
+                const ggml_tensor * a_src = s.second->a;
+                const ggml_tensor * b_src = s.second->b;
+
+                const int64_t r_src = b_src->ne[0];
+
+                // lora_a: the rank axis is ne[1], so a source contributes runs of ne[0] elements
+                {
+                    const int64_t k  = a_src->ne[0];
+                    const int64_t n2 = a_src->ne[2];
+                    const int64_t n3 = a_src->ne[3];
+                    const size_t  sz_src = ggml_type_size(a_src->type);
+                    const size_t  sz_dst = ggml_type_size(dst.a->type);
+
+                    if (host_src.size() < ggml_nbytes(a_src)) {
+                        host_src.resize(ggml_nbytes(a_src));
+                    }
+                    ggml_backend_tensor_get(a_src, host_src.data(), 0, ggml_nbytes(a_src));
+
+                    for (int64_t p = 0; p < n2*n3; ++p) {
+                        for (int64_t j = 0; j < r_src; ++j) {
+                            // the scale is folded into lora_b only, so lora_a is a plain concatenation
+                            llama_adapter_lora_concat_chunk(
+                                    host_a.data() + (p*r_all + r_off + j)*k*sz_dst,
+                                    host_src.data() + (p*r_src + j)*k*sz_src,
+                                    a_src->type, dst.a->type, k, 1.0f);
+                        }
+                    }
+                }
+
+                // lora_b: the rank axis is ne[0], so a source contributes runs of r_src elements
+                {
+                    const int64_t m  = b_src->ne[1];
+                    const int64_t n2 = b_src->ne[2];
+                    const int64_t n3 = b_src->ne[3];
+                    const size_t  sz_src = ggml_type_size(b_src->type);
+                    const size_t  sz_dst = ggml_type_size(dst.b->type);
+
+                    if (host_src.size() < ggml_nbytes(b_src)) {
+                        host_src.resize(ggml_nbytes(b_src));
+                    }
+                    ggml_backend_tensor_get(b_src, host_src.data(), 0, ggml_nbytes(b_src));
+
+                    for (int64_t p = 0; p < n2*n3; ++p) {
+                        for (int64_t i1 = 0; i1 < m; ++i1) {
+                            llama_adapter_lora_concat_chunk(
+                                    host_b.data() + ((p*m + i1)*r_all + r_off)*sz_dst,
+                                    host_src.data() + (p*m + i1)*r_src*sz_src,
+                                    b_src->type, dst.b->type, r_src, c);
+                        }
+                    }
+                }
+
+                r_off += r_src;
+            }
+
+            GGML_ASSERT(r_off == r_all);
+
+            ggml_backend_tensor_set(dst.a, host_a.data(), 0, ggml_nbytes(dst.a));
+            ggml_backend_tensor_set(dst.b, host_b.data(), 0, ggml_nbytes(dst.b));
+        }
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: failed to concatenate lora adapters: %s\n", __func__, err.what());
+
+        delete adapter;
+        return nullptr;
+    }
+
+    // debug: dump the concatenated factors so they can be compared against an offline concatenation
+    if (const char * dump_dir = getenv("LLAMA_LORA_CONCAT_DUMP")) {
+        for (const auto & it : adapter->ab_map) {
+            const ggml_tensor * ts[2] = { it.second.a, it.second.b };
+            const char * sfx[2] = { ".lora_a", ".lora_b" };
+            for (int i = 0; i < 2; ++i) {
+                std::vector<uint8_t> buf(ggml_nbytes(ts[i]));
+                ggml_backend_tensor_get(ts[i], buf.data(), 0, buf.size());
+                const std::string path = std::string(dump_dir) + "/" + it.first + sfx[i] + ".bin";
+                if (FILE * f = fopen(path.c_str(), "wb")) {
+                    fwrite(buf.data(), 1, buf.size(), f);
+                    fclose(f);
+                }
+            }
+        }
+        LLAMA_LOG_INFO("%s: dumped the concatenation to '%s'\n", __func__, dump_dir);
+    }
+
+    int64_t rank_min = INT64_MAX;
+    for (const auto & it : rank_t) {
+        rank_min = std::min(rank_min, it.second);
+    }
+
+    LLAMA_LOG_INFO("%s: concatenated %zu adapters into %zu weights, alpha = %.1f, rank %" PRId64 "..%" PRId64
+            ", %.0f MiB, alloc %.2f s, copy %.2f s\n", __func__, n_adapters, adapter->ab_map.size(), adapter->alpha,
+            rank_min, alpha, size_mib, (t_alloc - t_start)/1e6, (ggml_time_us() - t_alloc)/1e6);
+
+    return adapter;
 }
 
 int32_t llama_adapter_meta_val_str(const llama_adapter_lora * adapter, const char * key, char * buf, size_t buf_size) {

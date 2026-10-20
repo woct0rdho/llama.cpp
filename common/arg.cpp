@@ -3966,6 +3966,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--lora-concat"},
+        {"--no-lora-concat"},
+        "concatenate the active LoRA adapters into one, so that a weight touched by n adapters costs one pair of matmuls instead of n (default: enabled)",
+        [](common_params & params, bool value) {
+            params.lora_concat = value;
+        }
+    ).set_env("LLAMA_ARG_LORA_CONCAT"));
+    add_opt(common_arg(
         {"--sleep-idle-seconds"}, "SECONDS",
         string_format("number of seconds of idleness after which the server will sleep (default: %d; -1 = disabled)", params.sleep_idle_seconds),
         [](common_params & params, int value) {
