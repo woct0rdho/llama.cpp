@@ -56,6 +56,7 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
     bool training;           // set by llama_opt_init()
+    bool lora_concat;        // concatenate the active adapters into one
 
     size_t moe_cache_size;
 

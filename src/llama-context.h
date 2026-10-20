@@ -8,6 +8,7 @@
 #include "llama-impl.h"
 #include "llama-memory.h"
 #include "llama-moe-cache.h"
+#include "llama-cpp.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -304,6 +305,12 @@ private:
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;
+
+    // what set_adapters_lora() was asked for; `loras` is either this or the concatenation below
+    llama_adapter_loras_ptr loras_src;
+
+    // the active adapters concatenated into one, when more than one is active (cparams.lora_concat)
+    llama_adapter_lora_ptr lora_concat;
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 

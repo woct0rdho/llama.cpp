@@ -1331,6 +1331,39 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         pimpl->lora.emplace_back(std::move(lora)); // copy to list of loaded adapters
     }
 
+    // concatenate the adapters into a single one, so that a weight touched by n of them costs one
+    // pair of matmuls instead of n. The factors are concatenated along the rank axis, which is
+    // exact, and the adapters it was built from are released: the caller only ever sees the result.
+    if (!model_only && params.lora_concat && !params.lora_init_without_apply && params.lora_adapters.size() > 1) {
+        std::vector<const llama_adapter_lora *> src;
+        std::vector<float> src_scales;
+
+        for (const auto & la : params.lora_adapters) {
+            if (la.ptr && la.scale != 0.0f) {
+                src.push_back(la.ptr);
+                src_scales.push_back(la.scale);
+            }
+        }
+
+        if (src.size() > 1) {
+            llama_adapter_lora * cat = llama_adapter_lora_concat(model, src.data(), src_scales.data(), src.size());
+            if (cat) {
+                common_adapter_lora_info info;
+                info.path  = string_format("concatenation of %zu adapters", src.size());
+                info.scale = 1.0f;
+                info.ptr   = cat;
+
+                // drop the sources (their device buffers) and hand out the concatenation instead
+                pimpl->lora.clear();
+                pimpl->lora.emplace_back(llama_adapter_lora_ptr(cat, llama_adapter_lora_deleter{}));
+
+                params.lora_adapters = { info };
+
+                LOG_INF("%s: using the concatenation, %zu adapters released\n", __func__, src.size());
+            }
+        }
+    }
+
     // updates params.sampling
     // TODO: fix naming
     common_init_sampler_from_model(model, params.sampling);
@@ -1745,6 +1778,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_v = params.cache_type_v;
 
     cparams.moe_cache_size = params.moe_cache_size;
+    cparams.lora_concat = params.lora_concat;
 
     return cparams;
 }
