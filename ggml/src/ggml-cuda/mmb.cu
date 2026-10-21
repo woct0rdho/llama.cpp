@@ -1429,7 +1429,7 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         if (big) mmb_dense_kernel<128, 256, 64, 64, 1><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
         else     { MMB_SMALL_DENSE(1, W); }
     } else if (mmb_quant_type_dense(src0->type)) {
-        mmb_dispatch_quant(src0->type, [&](auto tag) {
+        mmb_dispatch_dense(src0->type, [&](auto tag) {
             constexpr int WT = decltype(tag)::value;
             if (big) mmb_dense_kernel<128, 256, 64, 64, WT><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
             else     { MMB_SMALL_DENSE(WT, W); }
@@ -1548,8 +1548,14 @@ bool ggml_cuda_mul_mat_mmb_lora(ggml_backend_cuda_context & ctx, const ggml_tens
         if (big) mmb_dense_lora_kernel<128, 256, 64, 64, WT><<<grid, MMB_NT, 0, stream>>>(wp, xhp, (float *) dst->data, M, K, T, lr);
         else     mmb_dense_lora_kernel<128, 128, 32, 64, WT><<<grid, MMB_NT, 0, stream>>>(wp, xhp, (float *) dst->data, M, K, T, lr);
     };
+    // Only the representations this path can actually be handed: the bf16 shadow, IQ4_NL, Q8_0. Dispatching through
+    // mmb_dispatch_quant() would instantiate the fused kernel for all ~20 quant types and both geometries, which is
+    // a large part of why this file took minutes to compile. Trellis types (when enabled) fall back to the separate
+    // pass, which is where they were before the fusion existed.
     if (shadow) launch(std::integral_constant<int, 2>{}, (const uint8_t *) shadow);
-    else mmb_dispatch_quant(w->type, [&](auto tag) { launch(tag, (const uint8_t *) w->data); });
+    else if (w->type == GGML_TYPE_IQ4_NL) launch(std::integral_constant<int, 0>{}, (const uint8_t *) w->data);
+    else if (w->type == GGML_TYPE_Q8_0)   launch(std::integral_constant<int, 1>{}, (const uint8_t *) w->data);
+    else return false;
     CUDA_CHECK(cudaGetLastError());
     if (getenv("GGML_CUDA_LORA_FUSE_DEBUG")) {
         fprintf(stderr, "mmb_lora: fused %s K=%d M=%d T=%d rank=%d shadow=%d\n", w->name, K, M, T, R, shadow != nullptr);
@@ -1582,7 +1588,7 @@ bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     if (hc_shadow) {
         hc_gate_mix_kernel<4, 2><<<grid, MMB_NT, 0, stream>>>((const uint8_t *) hc_shadow, lo16, xn16, (float *) dst->data, outh, store_f32, E, K, T, scale, bias);
     } else
-    mmb_dispatch_quant(w->type, [&](auto tag) {
+    mmb_dispatch_dense(w->type, [&](auto tag) {
         constexpr int WT = decltype(tag)::value;
     hc_gate_mix_kernel<4, WT><<<grid, MMB_NT, 0, stream>>>((const uint8_t *) w->data, lo16, xn16, (float *) dst->data, outh, store_f32, E, K, T, scale, bias);
     });
@@ -1830,3 +1836,4 @@ void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_te
     CUDA_CHECK(cudaGetLastError());
     mmb_state(ctx).shadow_bytes += bytes;
 }
+
