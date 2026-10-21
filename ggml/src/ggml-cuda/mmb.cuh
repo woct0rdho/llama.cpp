@@ -42,4 +42,4 @@ void ggml_cuda_mmb_release_all(ggml_backend_cuda_context & ctx);
 bool ggml_cuda_mul_mat_mmb_lora(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * x,
         const ggml_tensor * la, const ggml_tensor * lb, float scale, ggml_tensor * dst);
 bool ggml_cuda_mul_mat_id_mmb_lora(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * x, const ggml_tensor * ids,
-        const ggml_tensor * lu, const ggml_tensor * lb, const ggml_tensor * xscale, ggml_tensor * dst);
+        const ggml_tensor * la, const ggml_tensor * lb, const float scale, const ggml_tensor * xscale, ggml_tensor * dst);

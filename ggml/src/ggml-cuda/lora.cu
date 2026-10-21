@@ -443,6 +443,94 @@ __launch_bounds__(256) static __global__ void lora_u_kernel(
     }
 }
 
+// u[rank, n_used, T] for one expert weight, all slots of a token in one pass over x: today's route through
+// mul_mat_id gathers x[.,t] once per used expert, i.e. n_used times per token, which is the largest single piece of
+// the MoE LoRA tax. The expert factors are read n_used times instead, but they are 10 MB per weight and stay in L2,
+// while x is the whole activation and comes from DRAM.
+// Layout is the one the fused epilogue reads: element (i, slot, token) at i + rank*(slot + n_used*token).
+template <int R, int NS, bool MX>
+__launch_bounds__(256) static __global__ void lora_u_id_kernel(
+        const __half * __restrict__ la, const float * __restrict__ x, const int32_t * __restrict__ ids,
+        float * __restrict__ u, const int n_k, const int n_used, const int n_tok, const int nch, const int si1,
+        const int64_t la_expert, const float scale) {
+    const int lane = threadIdx.x & 31;
+    const int64_t t = (int64_t) blockIdx.x*(blockDim.x/32) + (threadIdx.x >> 5);
+    if (t >= n_tok) {
+        return;
+    }
+    const int32_t * id_row = ids + t*si1;
+    float * u_col = u + (int64_t) R*(int64_t) n_used*t;
+    for (int s0 = 0; s0 < n_used; s0 += NS) {
+        const int sn = min(NS, n_used - s0);
+        const __half * le[NS];
+        float acc[NS][R];
+#pragma unroll
+        for (int s = 0; s < NS; ++s) {
+            le[s] = la + (int64_t) id_row[s0 + (s < sn ? s : 0)] * la_expert;
+#pragma unroll
+            for (int i = 0; i < R; ++i) acc[s][i] = 0.0f;
+        }
+        // x is [K, 1, T]: every slot of a token reads the same column, so one pass covers all of them. When each used
+        // expert carries its own activation (the down projection's SwiGLU output, x = [K, n_used, T]) the column is
+        // the one ggml's mul_mat_id uses, slot + n_used*token, and it is read per slot.
+        for (int k = 4*lane; k + 3 < n_k; k += 128) {
+            const float4 xv0 = *(const float4 *) (x + (int64_t) t*nch*n_k + k);
+#pragma unroll
+            for (int s = 0; s < NS; ++s) {
+                if (s < sn) {
+                    const float4 xv = MX ? *(const float4 *) (x + (int64_t) (t*nch + s0 + s)*n_k + k) : xv0;
+#pragma unroll
+                    for (int i = 0; i < R; ++i) {
+                        const __half * p = le[s] + (int64_t) i*n_k + k;
+                        const float2 f0 = __half22float2(*(const __half2 *) p);
+                        const float2 f1 = __half22float2(*(const __half2 *) (p + 2));
+                        acc[s][i] = fmaf(f0.x, xv.x, acc[s][i]);
+                        acc[s][i] = fmaf(f0.y, xv.y, acc[s][i]);
+                        acc[s][i] = fmaf(f1.x, xv.z, acc[s][i]);
+                        acc[s][i] = fmaf(f1.y, xv.w, acc[s][i]);
+                    }
+                }
+            }
+        }
+        // one contiguous run of R*NS floats per (token, slot group), written by lane 0 after the warp reduction
+        float v[NS][R];
+#pragma unroll
+        for (int s = 0; s < NS; ++s) {
+#pragma unroll
+            for (int i = 0; i < R; ++i) v[s][i] = warp_reduce_sum(acc[s][i]);
+        }
+        if (lane == 0) {
+#pragma unroll
+            for (int s = 0; s < NS; ++s) {
+                if (s < sn) {
+#pragma unroll
+                    for (int i = 0; i < R; ++i) u_col[(int64_t) R*(s0 + s) + i] = v[s][i]*scale;
+                }
+            }
+        }
+    }
+}
+
+void ggml_cuda_lora_u_id(const void * la, const float * x, const void * ids, const int64_t si1, float * u,
+        const int64_t n_k, const int64_t n_tok, const int n_used, const int nch, const int n_rank, const int64_t la_expert,
+        const float scale, cudaStream_t stream) {
+    GGML_ASSERT(n_k % 4 == 0 && n_rank >= 2 && n_rank <= 8 && (n_rank & 1) == 0);
+    const dim3 blocks((unsigned int) ((n_tok + 7) / 8));
+    const int nk = (int) n_k, nt = (int) n_tok, si = (int) si1;
+    const __half * lap = (const __half *) la;
+    const int32_t * idp = (const int32_t *) ids;
+    const bool mx = nch > 1;
+#define LORA_U_ID_LAUNCH(R_, NS_)     if (mx) { lora_u_id_kernel<R_, NS_, true><<<blocks, 256, 0, stream>>>(lap, x, idp, u, nk, n_used, nt, nch, si, la_expert, scale); } \
+    else    { lora_u_id_kernel<R_, NS_, false><<<blocks, 256, 0, stream>>>(lap, x, idp, u, nk, n_used, nt, nch, si, la_expert, scale); }
+    switch (n_rank) {
+        case 2:  LORA_U_ID_LAUNCH(2, 10); break;
+        case 4:  LORA_U_ID_LAUNCH(4, 10); break;
+        case 6:  LORA_U_ID_LAUNCH(6, 5);  break;
+        default: LORA_U_ID_LAUNCH(8, 5);  break;
+    }
+#undef LORA_U_ID_LAUNCH
+}
+
 void ggml_cuda_lora_u(const void * la, const float * x, float * u, const int64_t n_k, const int64_t n_tok,
         const int n_rank, cudaStream_t stream) {
     const dim3 blocks((unsigned int) ((n_tok + 7) / 8));
