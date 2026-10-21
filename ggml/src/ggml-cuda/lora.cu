@@ -1,4 +1,5 @@
 #include "lora.cuh"
+#include "mmb.cuh"
 
 // mul_mat_id computes dst[i0, i1, i2] = sum_k src0[k, i0, ids[i1, i2]] * src1[k, i1, i2],
 // mul_mat is the same without ids. A LoRA factor is F16 with a rank-sized dimension of 4,
@@ -191,8 +192,13 @@ static bool lora_shapes_ok(const ggml_tensor * dst, bool has_ids) {
     const bool narrow_out = src0->ne[1] <= 8 && src0->ne[0] >= 64 && src0->ne[0] <= 4096 && src0->ne[0] % 2 == 0;
     const bool narrow_in  = src0->ne[0] <= 8 && src0->ne[1] >= 64;
 
-    // n_out outputs are spread over the block, so keep the count inside the block size
-    if (narrow_out && src0->ne[1] * dst->ne[1] <= 128) {
+    // the lora_a kernel spreads n_rank * n_cols outputs over one block, one block per (expert,)
+    // token, so the only limit is that count. dst->ne[1] is n_cols for mul_mat_id ([m, n_used,
+    // n_tokens]) but n_tokens for mul_mat (a n_tokens << 128 limit here would keep every prefill
+    // token count off the fused kernel, which is where it pays the most)
+    const int64_t n_cols = has_ids ? dst->ne[1] : 1;
+
+    if (narrow_out && src0->ne[1] * n_cols <= 256) {
         return true;
     }
     return narrow_in;
@@ -300,6 +306,191 @@ void ggml_cuda_mul_mat_lora(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
                 nb01, nb02, nb10, 0, nb11,
                 0, 0, 0, nb1,
                 /*has_ids =*/ false);
+    }
+
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// out[M, N] = base[M, N] + scale * (lora_b[rank, M] @ (lora_a[K, rank] @ x[K, N]))
+//
+// one warp per token: the K reduction becomes a shuffle reduction (no block barrier, no LDS) and
+// every warp of the block reads the same lora_a / lora_b, which stay in L1, so the factors are not
+// re-read from L2 once per token. x is contiguous along K and base/out along M, so both phases are
+// coalesced within the warp.
+// VEC reads x / base / out 128 B at a time per warp iteration (4 floats per lane) and the
+// 4*rank halves of lora_b that cover the same four rows in one 16-byte access, so the block's
+// loads are 16 B wide instead of 4 B. Requires K % 4 == 0, M % 4 == 0 and an even rank.
+template <int NR_MAX, bool VEC>
+__launch_bounds__(256) static __global__ void mul_mat_lora_kernel(
+        const __half * __restrict__ la,   // [K, rank] F16, contiguous
+        const __half * __restrict__ lb,   // [rank, M] F16, contiguous
+        const float  * __restrict__ x,    // [K, N] F32
+        const float  * __restrict__ base, // [M, N] F32
+        float        * __restrict__ out,  // [M, N] F32
+        const int64_t n_k, const int64_t n_m, const int64_t n_tok, const int n_rank, const float scale) {
+    const int lane = threadIdx.x & 31;
+    const int64_t n = (int64_t) blockIdx.x*(blockDim.x/32) + (threadIdx.x >> 5);
+
+    if (n >= n_tok) {
+        return;
+    }
+
+    float u[NR_MAX];
+#pragma unroll
+    for (int i = 0; i < NR_MAX; ++i) {
+        u[i] = 0.0f;
+    }
+
+    // phase 1: u[rank] = lora_a @ x[:, n]
+    const float * x_col = x + n*n_k;
+    if (VEC) {
+        for (int64_t k = 4*lane; k < n_k; k += 128) {
+            const float4 xv = *(const float4 *) (x_col + k);
+            for (int i = 0; i < n_rank; ++i) {
+                const float2 f0 = __half22float2(*(const __half2 *) (la + i*n_k + k));
+                const float2 f1 = __half22float2(*(const __half2 *) (la + i*n_k + k + 2));
+                u[i] = fmaf(f0.x, xv.x, u[i]);
+                u[i] = fmaf(f0.y, xv.y, u[i]);
+                u[i] = fmaf(f1.x, xv.z, u[i]);
+                u[i] = fmaf(f1.y, xv.w, u[i]);
+            }
+        }
+    } else {
+        for (int64_t k = lane; k < n_k; k += 32) {
+            const float xv = x_col[k];
+            for (int i = 0; i < n_rank; ++i) {
+                u[i] = fmaf(__half2float(la[i*n_k + k]), xv, u[i]);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int i = 0; i < NR_MAX; ++i) {
+        if (i < n_rank) {
+            u[i] = warp_reduce_sum(u[i]) * scale;   // the scale is folded in here, for free
+        }
+    }
+
+    // phase 2: out[:, n] = base[:, n] + lora_b @ u
+    const float * base_col = base + n*n_m;
+    float * out_col = out + n*n_m;
+    if (VEC) {
+        for (int64_t m = 4*lane; m < n_m; m += 128) {
+            // lb[m .. m+3] is the contiguous span lb + m*rank, 4*rank halves = 4 rows
+            uint4 raw[4];
+            const char * src = (const char *) (lb + m*n_rank);
+            const int nb16 = (4*n_rank*2 + 15)/16;
+            for (int t = 0; t < nb16; ++t) {
+                raw[t] = *(const uint4 *) (src + 16*t);
+            }
+            const __half * h = (const __half *) raw;
+            float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+            for (int i = 0; i < n_rank; ++i) {
+                s0 = fmaf(__half2float(h[0*n_rank + i]), u[i], s0);
+                s1 = fmaf(__half2float(h[1*n_rank + i]), u[i], s1);
+                s2 = fmaf(__half2float(h[2*n_rank + i]), u[i], s2);
+                s3 = fmaf(__half2float(h[3*n_rank + i]), u[i], s3);
+            }
+            const float4 bv = *(const float4 *) (base_col + m);
+            float4 ov;
+            ov.x = bv.x + s0;
+            ov.y = bv.y + s1;
+            ov.z = bv.z + s2;
+            ov.w = bv.w + s3;
+            *(float4 *) (out_col + m) = ov;
+        }
+    } else {
+        for (int64_t m = lane; m < n_m; m += 32) {
+            float s = 0.0f;
+            const __half * lb_row = lb + m*n_rank;
+            for (int i = 0; i < n_rank; ++i) {
+                s = fmaf(__half2float(lb_row[i]), u[i], s);
+            }
+            out_col[m] = base_col[m] + s;
+        }
+    }
+}
+
+// u[rank, T] = lora_a[K, rank]^T @ x[K, T], the factor the fused MMB epilogue reads. One warp per token.
+__launch_bounds__(256) static __global__ void lora_u_kernel(
+        const __half * __restrict__ la, const float * __restrict__ x, float * __restrict__ u,
+        const int64_t n_k, const int64_t n_tok, const int n_rank) {
+    const int lane = threadIdx.x & 31;
+    const int64_t n = (int64_t) blockIdx.x*(blockDim.x/32) + (threadIdx.x >> 5);
+    if (n >= n_tok) {
+        return;
+    }
+    const float * x_col = x + n*n_k;
+    for (int i = 0; i < n_rank; ++i) {
+        float acc = 0.0f;
+        if (n_k % 4 == 0) {
+            for (int64_t k = 4*lane; k < n_k; k += 128) {
+                const float4 xv = *(const float4 *) (x_col + k);
+                const float2 f0 = __half22float2(*(const __half2 *) (la + i*n_k + k));
+                const float2 f1 = __half22float2(*(const __half2 *) (la + i*n_k + k + 2));
+                acc = fmaf(f0.x, xv.x, acc);
+                acc = fmaf(f0.y, xv.y, acc);
+                acc = fmaf(f1.x, xv.z, acc);
+                acc = fmaf(f1.y, xv.w, acc);
+            }
+        } else {
+            for (int64_t k = lane; k < n_k; k += 32) {
+                acc = fmaf(__half2float(la[i*n_k + k]), x_col[k], acc);
+            }
+        }
+        // rank axis innermost, the layout the fused epilogue reads: element (i, tok) at i + rank*tok
+        u[(int64_t) i + (int64_t) n_rank*n] = warp_reduce_sum(acc);
+    }
+}
+
+void ggml_cuda_lora_u(const void * la, const float * x, float * u, const int64_t n_k, const int64_t n_tok,
+        const int n_rank, cudaStream_t stream) {
+    const dim3 blocks((unsigned int) ((n_tok + 7) / 8));
+    lora_u_kernel<<<blocks, 256, 0, stream>>>((const __half *) la, x, u, n_k, n_tok, n_rank);
+}
+
+void ggml_cuda_mul_mat_lora_apply(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * la   = dst->src[0];
+    const ggml_tensor * lb   = dst->src[1];
+    const ggml_tensor * x    = dst->src[2];
+    const ggml_tensor * base = dst->src[3];
+
+    const int64_t n_k    = la->ne[0];
+    const int64_t n_rank = la->ne[1];
+    const int64_t n_m    = lb->ne[1];
+    const int64_t n_tok  = x->ne[1];
+
+    float scale = 0.0f;
+    memcpy(&scale, dst->op_params, sizeof(float));
+
+    GGML_ASSERT(la->type == GGML_TYPE_F16 && lb->type == GGML_TYPE_F16);
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && base->type == GGML_TYPE_F32);
+    GGML_ASSERT(n_rank >= 1 && n_rank <= 8);
+    GGML_ASSERT(ggml_is_contiguous(la) && ggml_is_contiguous(lb) && ggml_is_contiguous(x) &&
+                ggml_is_contiguous(base) && ggml_is_contiguous(dst));
+
+    // 8 tokens per block (one warp each)
+    constexpr int n_threads = 256;
+    const dim3 blocks((unsigned int) ((n_tok + 7) / 8));
+
+    cudaStream_t stream = ctx.stream();
+
+    // the vectorized path needs whole float4 groups on both sides and whole 16-byte factor reads
+    const bool vec = n_k % 4 == 0 && n_m % 4 == 0 && n_rank % 2 == 0 &&
+                     (reinterpret_cast<uintptr_t>(x->data)    % 16) == 0 &&
+                     (reinterpret_cast<uintptr_t>(base->data) % 16) == 0 &&
+                     (reinterpret_cast<uintptr_t>(dst->data)  % 16) == 0;
+
+    if (vec) {
+        mul_mat_lora_kernel<8, true><<<blocks, n_threads, 0, stream>>>(
+                (const __half *) la->data, (const __half *) lb->data,
+                (const float *) x->data, (const float *) base->data, (float *) dst->data,
+                n_k, n_m, n_tok, (int) n_rank, scale);
+    } else {
+        mul_mat_lora_kernel<8, false><<<blocks, n_threads, 0, stream>>>(
+                (const __half *) la->data, (const __half *) lb->data,
+                (const float *) x->data, (const float *) base->data, (float *) dst->data,
+                n_k, n_m, n_tok, (int) n_rank, scale);
     }
 
     CUDA_CHECK(cudaGetLastError());

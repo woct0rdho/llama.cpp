@@ -7012,6 +7012,72 @@ static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats, float amax) 
 }
 
 // GGML_OP_MUL_MAT_ID
+
+// the same apply emitted on top of its own matmul, the shape the CUDA backend fuses into the MMB epilogue:
+// out = w @ x + scale * lora_b @ (lora_a @ x). The CPU reference walks the two nodes unfused, so this
+// pins the epilogue correction against the generic chain.
+struct test_mul_mat_lora_fused : public test_case {
+    const ggml_type type_w;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const int64_t r;
+
+    std::string vars() override { return VARS_TO_STR5(type_w, m, n, k, r); }
+
+    double max_nmse_err() override {
+        return type_w == GGML_TYPE_F16 ? 1e-7 : 1e-3;
+    }
+
+    test_mul_mat_lora_fused(ggml_type type_w = GGML_TYPE_F16, int64_t m = 2560, int64_t n = 2048, int64_t k = 2560, int64_t r = 4)
+        : type_w(type_w), m(m), n(n), k(k), r(r) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, type_w, k, m);
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k, r);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, r, m);
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(w, "w");
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+        ggml_set_name(x, "x");
+        ggml_tensor * mm = ggml_mul_mat(ctx, w, x);
+        ggml_set_name(mm, "mm");
+        return ggml_mul_mat_lora(ctx, a, b, x, mm, 1.0f);
+    }
+};
+
+// out = base + scale * lora_b @ (lora_a @ x), the fused LoRA apply used at prefill
+struct test_mul_mat_lora : public test_case {
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const int64_t r;
+    const float   scale;
+
+    std::string vars() override { return VARS_TO_STR5(m, n, k, r, scale); }
+
+    test_mul_mat_lora(int64_t m = 2560, int64_t n = 8192, int64_t k = 2560, int64_t r = 4, float scale = 1.0f)
+        : m(m), n(n), k(k), r(r), scale(scale) {}
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return (uint64_t) (2*n*k*r + 2*n*m*r);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a    = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k, r);
+        ggml_tensor * b    = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, r, m);
+        ggml_tensor * x    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * base = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, n);
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+        ggml_set_name(x, "x");
+        ggml_set_name(base, "base");
+        return ggml_mul_mat_lora(ctx, a, b, x, base, scale);
+    }
+};
+
 struct test_mul_mat_id : public test_case {
     const ggml_type type_a;
     const ggml_type type_b;
@@ -14281,6 +14347,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 4, n, 10240, {1, 1}, {1, 1}));
     }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 4, 509, 2051, {1, 1}, {1, 1}));
+    // fused LoRA apply, the qwen4exp prefill shapes (K x rank factors, M outputs, N tokens)
+    for (int64_t n : {2048, 8192, 16384}) {
+        test_cases.emplace_back(new test_mul_mat_lora(2560, n, 2560, 4));
+        test_cases.emplace_back(new test_mul_mat_lora(2560, n, 6144, 6));
+        test_cases.emplace_back(new test_mul_mat_lora( 640, n, 2560, 4));
+        test_cases.emplace_back(new test_mul_mat_lora(2560, n,  640, 4));
+    }
+    test_cases.emplace_back(new test_mul_mat_lora(2560, 262144, 2560, 4));   // long context ceiling
+    test_cases.emplace_back(new test_mul_mat_lora_fused(GGML_TYPE_F16,    2560, 2048, 2560, 4));
+    test_cases.emplace_back(new test_mul_mat_lora_fused(GGML_TYPE_F16,    2560, 1024,  640, 6));
+    test_cases.emplace_back(new test_mul_mat_lora_fused(GGML_TYPE_IQ4_NL, 2560, 2048, 2560, 4));
+    test_cases.emplace_back(new test_mul_mat_lora_fused(GGML_TYPE_IQ4_NL,  512, 2048, 2560, 4));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 4, 509, 2051, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 4, 509, 2051, {2, 1}, {1, 1}));
 
@@ -16043,6 +16121,13 @@ struct test_mmvq_perf : test_mul_mat {
 
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    // fused LoRA apply at the qwen4exp prefill shapes: K x rank factors, M outputs, N tokens
+    for (int64_t n : {2048, 8192, 16384}) {
+        test_cases.emplace_back(new test_mul_mat_lora(2560, n, 2560, 4));
+        test_cases.emplace_back(new test_mul_mat_lora(2560, n, 6144, 6));
+        test_cases.emplace_back(new test_mul_mat_lora( 640, n, 2560, 4));
+        test_cases.emplace_back(new test_mul_mat_lora(2560, n,  640, 4));
+    }
     // sparse decode attention at the context lengths that matter, one query row (TG) and one row per stream
     for (int kv : {4096, 16384, 32768, 65536, 131072}) test_cases.emplace_back(new test_qsa_decode(1, kv, 2051));
     test_cases.emplace_back(new test_qsa_decode(16, 131072, 2051));

@@ -2514,6 +2514,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_MUL_MAT_ID:
             ggml_cuda_mul_mat_id(ctx, dst);
             break;
+        case GGML_OP_MUL_MAT_LORA:
+            ggml_cuda_mul_mat_lora_apply(ctx, dst);
+            break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
             break;
@@ -6477,6 +6480,67 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // LoRA apply sitting on top of its own matmul: out = W @ x + scale * lora_b @ (lora_a @ x). The
+    // correction is folded into the MMB epilogue, so the [M, T] output is written once by the matmul
+    // instead of being written by it and then read+written twice more by the apply.
+    if (node->op == GGML_OP_MUL_MAT && ggml_node_has_n_uses(cgraph, i, 1) && i + 1 < cgraph->n_nodes &&
+            cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT_LORA && getenv("GGML_CUDA_NO_LORA_FUSE") == nullptr) {
+        const ggml_tensor * app = cgraph->nodes[i + 1];
+        const ggml_tensor * la  = app->src[0];
+        const ggml_tensor * lb  = app->src[1];
+        const ggml_tensor * xx  = app->src[2];
+        if (app->src[3] == node && xx == node->src[1] && la && lb) {
+            float lscale = 0.0f;
+            memcpy(&lscale, app->op_params, sizeof(float));
+            const int idx[2]  = { i, i + 1 };
+            const int outs[1] = { i + 1 };
+            const enum ggml_op fops[2] = { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_LORA };
+            if (ggml_can_fuse_subgraph_ext(cgraph, idx, 2, fops, outs, 1) &&
+                ggml_cuda_mul_mat_mmb_lora(*cuda_ctx, node->src[0], node->src[1], la, lb, lscale, (ggml_tensor *) app)) {
+                return 1;
+            }
+        }
+    }
+
+    // MoE LoRA: mul_mat_id(b, scale(mul_mat_id(a, x))) added on top of mul_mat_id(w, x). The builder puts that
+    // correction chain first (src/llama-graph.cpp, build_lora_mm_id), so the three nodes are adjacent here and the
+    // routed matmul can compute the corrected product itself: scale * lora_b_e @ u goes into its accumulator, and
+    // neither the [M, n_used, T] product of the b-matmul nor the extra read+write of the add happen at all.
+    // A weight with a shared-expert scale (w_s) has that MUL between the product and the add; the factor is per
+    // (slot, token), the same column the epilogue already indexes, so it folds in as well.
+    if (node->op == GGML_OP_MUL_MAT_ID && ggml_node_has_n_uses(cgraph, i, 1) && i + 2 < cgraph->n_nodes &&
+            getenv("GGML_CUDA_NO_LORA_FUSE") == nullptr &&
+            cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT_ID && cgraph->nodes[i + 2]->op == GGML_OP_ADD) {
+        const ggml_tensor * base = cgraph->nodes[i + 1];   // the expert product this correction belongs to
+        const ggml_tensor * add  = cgraph->nodes[i + 2];
+        const ggml_tensor * sc   = node->src[1];           // the scaled u = lora_a @ x
+        // the add's other operand is the product itself, or its per-column scale (w_s)
+        const ggml_tensor * prod = add->src[1] == base ? base : nullptr;
+        const ggml_tensor * xs   = nullptr;
+        if (prod == nullptr && add->src[1] && add->src[1]->op == GGML_OP_MUL && add->src[1]->src[0] == base) {
+            int xi = -1;
+            for (int k = i; k >= 0 && xi < 0; --k) { if (cgraph->nodes[k] == add->src[1]) xi = k; }
+            // the scaled product must have no other reader: the product it scales is what this replaces
+            if (xi >= 0 && ggml_node_has_n_uses(cgraph, xi, 1)) {
+                prod = base;
+                xs   = add->src[1]->src[1];
+            }
+        }
+        if (prod && add->src[0] == node && node->src[0] && node->src[2] == base->src[2] &&
+                sc && sc->op == GGML_OP_SCALE && sc->src[0] && sc->src[0]->op == GGML_OP_MUL_MAT_ID &&
+                sc->src[0]->src[1] == base->src[1] && sc->src[0]->src[2] == base->src[2] &&
+                ggml_node_has_n_uses(cgraph, i + 1, 1)) {
+            const int idx[3]  = { i, i + 1, i + 2 };
+            const int outs[1] = { i + 2 };
+            const enum ggml_op fops[3] = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_ADD };
+            if (ggml_can_fuse_subgraph_ext(cgraph, idx, 3, fops, outs, 1) &&
+                ggml_cuda_mul_mat_id_mmb_lora(*cuda_ctx, base->src[0], base->src[1], base->src[2],
+                        sc, node->src[0], xs, (ggml_tensor *) add)) {
+                return 2;
+            }
+        }
+    }
+
     // qwen4exp hyper-connection stream mix:
     // HC gate GEMM [320 -> 10240] whose only consumer is the fused stream mix: GEMM + sigmoid + mix in one kernel
     if (node->op == GGML_OP_MUL_MAT && ggml_node_has_n_uses(cgraph, i, 1)) {
@@ -8257,6 +8321,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 default:
                     return false;
             }
+        case GGML_OP_MUL_MAT_LORA:
+            {
+                return op->src[0]->type == GGML_TYPE_F16 && op->src[1]->type == GGML_TYPE_F16 &&
+                       op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
+                       op->src[0]->ne[1] >= 1 && op->src[0]->ne[1] <= 8 &&
+                       ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                       ggml_is_contiguous(op->src[2]) && ggml_is_contiguous(op->src[3]) &&
+                       ggml_is_contiguous(op);
+            }
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
             {
@@ -8708,6 +8781,7 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
         case GGML_OP_GET_ROWS:
             return 0;
         case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_LORA:
             return op->ne[1];
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_ROPE:
