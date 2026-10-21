@@ -1671,33 +1671,37 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
 }
 
 // MoE LoRA applied inside the routed expert matmul: dst = w @ x + scale * lora_b @ (lora_a @ x), summed over the
-// selected experts. u is built here, indexed by (slot, token) exactly like the expert product's columns, so the
-// epilogue only has to move lora_b to the block's expert. Replaces five graph nodes, see
-// docs_gfx1151/lora_mmb_fusion_plan.md.
+// selected experts. u is built here, one pass over x for all n_used slots of a token, and indexed by (slot, token)
+// exactly like the expert product's columns, so the epilogue only has to move lora_b to the block's expert. This
+// replaces five graph nodes, see docs_gfx1151/lora_mmb_fusion_plan.md.
 #define LORA_ID_FAIL(why) do { \
     static const bool dbg = getenv("GGML_CUDA_LORA_FUSE_DEBUG") != nullptr; \
     if (dbg) { fprintf(stderr, "moe-skip %s: %s\n", w->name, why); } \
     return false; \
 } while (0)
 bool ggml_cuda_mul_mat_id_mmb_lora(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * x, const ggml_tensor * ids,
-        const ggml_tensor * lu, const ggml_tensor * lb, const ggml_tensor * xscale, ggml_tensor * dst) {
+        const ggml_tensor * la, const ggml_tensor * lb, const float scale, const ggml_tensor * xscale, ggml_tensor * dst) {
     if (!ggml_cuda_mmb_supported_mmid(ctx, w, x, ids, dst)) LORA_ID_FAIL("supported_mmid");
-    if (lb->type != GGML_TYPE_F16 || !ggml_is_contiguous(lb)) LORA_ID_FAIL("lb type/contig");
+    if (la->type != GGML_TYPE_F16 || lb->type != GGML_TYPE_F16 || !ggml_is_contiguous(la) || !ggml_is_contiguous(lb)) LORA_ID_FAIL("factors");
     if (ggml_cuda_mmb_is_bf16_only(ctx, dst)) LORA_ID_FAIL("bf16_only dst");   // the fused epilogue stores F32
     const int K = (int) w->ne[0], M = (int) w->ne[1], E = (int) w->ne[2];
     const int R = (int) lb->ne[0], n_used = (int) ids->ne[0], T = (int) x->ne[2];
     if (R < 2 || R > 8 || (R & 1)) LORA_ID_FAIL("rank");
-    if (lu->type != GGML_TYPE_F32 || lu->ne[0] != R || lu->ne[1] != n_used || lu->ne[2] != T) LORA_ID_FAIL("lu shape");
+    if (la->ne[0] != K || la->ne[1] != R || la->ne[2] != E) LORA_ID_FAIL("la shape");
     if (lb->ne[1] != M || lb->ne[2] != E) LORA_ID_FAIL("lb shape");
     // x is [K, 1, T], or [K, n_used, T] when every used expert carries its own activation (the down projection's
-    // per-slot SwiGLU output). The routed kernel gathers both the same way, and u's column is the same (slot, token)
-    // column the store uses, so nothing else changes.
+    // per-slot SwiGLU output). The u prepass reads the token columns, which is the same for both.
     if ((x->ne[1] != 1 && x->ne[1] != n_used) || K % MMB_BK != 0 || M % 16 != 0) LORA_ID_FAIL("x/K/M");
     if (xscale && (xscale->type != GGML_TYPE_F32 || !ggml_is_contiguous(xscale) || xscale->ne[0] != 1 ||
                 xscale->ne[1] != n_used || xscale->ne[2] != T)) LORA_ID_FAIL("xscale shape");
     cudaStream_t stream = ctx.stream();
-    // lu already carries the adapter scale, so the epilogue's factor is 1
-    const mmb_lora_t lr = { (const float *) lu->data, (const uint16_t *) lb->data, xscale ? (const float *) xscale->data : nullptr,
+    const int64_t n_col = (int64_t) n_used * T;
+    ggml_cuda_pool_alloc<float> lu(ctx.pool(), (size_t) R * n_col);
+    if (!lu.ptr) LORA_ID_FAIL("u buffer");
+    // the adapter scale goes into u, so the epilogue's factor is 1
+    ggml_cuda_lora_u_id(la->data, (const float *) x->data, ids->data, (int64_t) (ids->nb[1] / sizeof(int32_t)), lu.ptr,
+            K, T, n_used, (int) x->ne[1], R, (int64_t) K * R, scale, stream);
+    const mmb_lora_t lr = { lu.ptr, (const uint16_t *) lb->data, xscale ? (const float *) xscale->data : nullptr,
             1.0f, R, (size_t) R * M * 2 };
     mmb_routed_run(ctx, w, x, ids, dst, &lr);
     if (getenv("GGML_CUDA_LORA_FUSE_DEBUG")) {
