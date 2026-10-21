@@ -1144,6 +1144,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "MUL_MAT",
     "MUL_MAT_ID",
+    "MUL_MAT_LORA",
     "OUT_PROD",
 
     "SCALE",
@@ -1226,7 +1227,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "EXL3_MUL_MAT_ID",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1261,6 +1262,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "X*Y",
     "X[i]*Y",
+    "X*Y + base",
     "X*Y",
 
     "x*v",
@@ -1343,7 +1345,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "exl3(X)[ids]*y",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3536,6 +3538,43 @@ void ggml_mul_mat_set_hint(
 
     an id of -1 skips the slot: no matrix is selected, c[:,e,t] is set to zero
 */
+struct ggml_tensor * ggml_mul_mat_lora(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * base,
+        float                 scale) {
+    GGML_ASSERT(a->type == GGML_TYPE_F16);
+    GGML_ASSERT(b->type == GGML_TYPE_F16);
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(base->type == GGML_TYPE_F32);
+
+    GGML_ASSERT(a->ne[0] == x->ne[0]);      // K
+    GGML_ASSERT(a->ne[1] == b->ne[0]);      // rank
+    GGML_ASSERT(b->ne[1] == base->ne[0]);   // M
+    GGML_ASSERT(x->ne[1] == base->ne[1]);   // N
+
+    GGML_ASSERT(a->ne[2] == 1 && a->ne[3] == 1);
+    GGML_ASSERT(b->ne[2] == 1 && b->ne[3] == 1);
+    GGML_ASSERT(x->ne[2] == 1 && x->ne[3] == 1);
+    GGML_ASSERT(base->ne[2] == 1 && base->ne[3] == 1);
+
+    const int64_t ne[4] = { b->ne[1], x->ne[1], 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 2, ne);
+
+    ggml_set_op_params_f32(result, 0, scale);
+
+    result->op     = GGML_OP_MUL_MAT_LORA;
+    result->src[0] = a;
+    result->src[1] = b;
+    result->src[2] = x;
+    result->src[3] = base;
+
+    return result;
+}
+
+
 struct ggml_tensor * ggml_mul_mat_id(
         struct ggml_context * ctx,
         struct ggml_tensor  * as,

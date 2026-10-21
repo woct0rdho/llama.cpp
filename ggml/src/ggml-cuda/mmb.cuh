@@ -82,3 +82,9 @@ bool ggml_cuda_mmb_dq_packed(const ggml_tensor * w);
 void ggml_cuda_mmb_dense_r2_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * w);
 void ggml_cuda_mul_mat_dq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 void ggml_cuda_mmb_release_all(ggml_backend_cuda_context & ctx);
+// dst = w @ x + scale * lora_b @ (lora_a @ x), the LoRA apply folded into the MMB epilogue. Returns
+// false if the weight or shape is not handled, in which case the caller uses the unfused chain.
+bool ggml_cuda_mul_mat_mmb_lora(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * x,
+        const ggml_tensor * la, const ggml_tensor * lb, float scale, ggml_tensor * dst);
+bool ggml_cuda_mul_mat_id_mmb_lora(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * x, const ggml_tensor * ids,
+        const ggml_tensor * lu, const ggml_tensor * lb, const ggml_tensor * xscale, ggml_tensor * dst);
