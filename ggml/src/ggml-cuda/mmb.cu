@@ -16,6 +16,7 @@ typedef float v8f  __attribute__((ext_vector_type(8)));
 constexpr int MMB_BK = 64, MMB_NT = 256, MMB_LDS_STRIDE = MMB_BK + 8;
 
 __device__ __forceinline__ uint16_t mmb_f2bf(float f) { uint32_t u = __float_as_uint(f); u += 0x7fffu + ((u >> 16) & 1u); return (uint16_t)(u >> 16); }
+
 // same RNE as mmb_f2bf on both halves, the two high halves joined by one v_perm_b32 (no mov_b16 + and_or). Unguarded
 // like the other __builtin_amdgcn_perm uses in this file: device code here is AMD-only.
 __device__ __forceinline__ uint32_t mmb_pack2(float a, float b) {
@@ -107,15 +108,79 @@ struct mmb_lora_t {
     size_t eb;              // per-expert stride of lb in bytes (0 for a dense weight)
 };
 
+// LoRA correction as an f16 WMMA operand, built in registers. For a 16x16 fragment the correction is
+// corr(16m x 16n) = lora_b(16m x rank) @ u(rank x 16n), which is the same shape the k-loop multiplies, so one
+// wmma_bfloat16 covers it. The operand layout the intrinsic wants is "lane r holds row r's 16 reduction values",
+// and lane r only ever needs its own row of lora_b and its own column of u, so both are packed here from global
+// memory (L2-resident) with no shared-memory staging and no barrier. Staging them in LDS instead was measured at
+// 14 % -> 19 % on the thin-K weight: the barrier in front of the store cost more than the FMAs it replaced.
+// f16 rather than bf16 because lora_b is already f16 (the A operand needs no conversion) and f16 gives u two more
+// mantissa bits, which matters: bf16 rounding of the operands moved PPL by 0.3 %.
+template <int R>
+__device__ __forceinline__ v16s mmb_lora_op_a(const uint16_t * __restrict__ lb, const int mrow, const bool ok) {
+    uint32_t w[4] = {0u, 0u, 0u, 0u};
+    if (ok) {
+        // lora_b is F16 and the f16 wmma takes F16 bits as they are: two loads, no conversion. (Fed to the bf16
+        // variant instead, a 0.01 factor becomes a BF16 denormal and the correction silently disappears.)
+        const uint32_t * p = (const uint32_t *) (lb + (size_t) mrow * R);   // R is even: 4-byte aligned
+#pragma unroll
+        for (int j = 0; j < R / 2; ++j) w[j] = p[j];
+    }
+    return __builtin_bit_cast(v16s, (uint4[2]){make_uint4(w[0], w[1], w[2], w[3]), make_uint4(0u, 0u, 0u, 0u)});
+}
+
+template <int R>
+__device__ __forceinline__ v16s mmb_lora_op_b(const float * __restrict__ lu, const int col, const float scale) {
+    uint32_t w[4] = {0u, 0u, 0u, 0u};
+    if (col >= 0) {
+#pragma unroll
+        for (int i = 0; i < R; i += 2) {
+            const uint16_t b0 = __half_as_ushort(__float2half_rn(lu[(size_t) i + (size_t) R * col] * scale));
+            const uint16_t b1 = __half_as_ushort(__float2half_rn(lu[(size_t) (i + 1) + (size_t) R * col] * scale));
+            w[i >> 1] = (uint32_t) b0 | ((uint32_t) b1 << 16);
+        }
+    }
+    return __builtin_bit_cast(v16s, (uint4[2]){make_uint4(w[0], w[1], w[2], w[3]), make_uint4(0u, 0u, 0u, 0u)});
+}
+
+__device__ __forceinline__ v16s mmb_lora_op_a_any(const mmb_lora_t & lr, const int mrow, const bool ok) {
+    switch (lr.rank) {
+        case 2:  return mmb_lora_op_a<2>(lr.lb, mrow, ok);
+        case 4:  return mmb_lora_op_a<4>(lr.lb, mrow, ok);
+        case 6:  return mmb_lora_op_a<6>(lr.lb, mrow, ok);
+        case 8:  return mmb_lora_op_a<8>(lr.lb, mrow, ok);
+        default: return mmb_lora_op_a<4>(lr.lb, mrow, false);
+    }
+}
+
+__device__ __forceinline__ v16s mmb_lora_op_b_any(const mmb_lora_t & lr, const int col) {
+    switch (lr.rank) {
+        case 2:  return mmb_lora_op_b<2>(lr.lu, col, lr.scale);
+        case 4:  return mmb_lora_op_b<4>(lr.lu, col, lr.scale);
+        case 6:  return mmb_lora_op_b<6>(lr.lu, col, lr.scale);
+        case 8:  return mmb_lora_op_b<8>(lr.lu, col, lr.scale);
+        default: return mmb_lora_op_b<4>(lr.lu, -1, lr.scale);
+    }
+}
+
 template <typename DRowFn>
 __device__ __forceinline__ void mmb_store_tile(const v8f & acc, float * __restrict__ stg, float * __restrict__ D, uint16_t * __restrict__ Dh,
         const bool store_f32, const int M, DRowFn drow, const int n_base, const int m_base, const int lane, const mmb_lora_t & lr) {
     const int cm = lane & 15, cn = lane >> 4;
+    const int n = lane >> 1, half = lane & 1;
+    const int dr = drow(n_base + n);
+    // Both correction operands are independent of acc, so read them before the staging barrier: the eight stores
+    // and the barrier are long enough to cover the latency, and after the barrier this lane only has the [1, M]
+    // column of D to write. Measured on the kernel benchmark, that is what the correction costs; a wmma version
+    // with LDS-staged BF16 operands was slower, see docs_gfx1151/lora_mmb_fusion_plan.md.
+    float ui[8];
+    if (lr.lu && dr >= 0) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) { ui[i] = (i < lr.rank) ? lr.lu[(size_t) i + (size_t) lr.rank * dr] : 0.0f; }
+    }
 #pragma unroll
     for (int e = 0; e < 8; ++e) { stg[(2 * e + cn) * 16 + cm] = acc[e]; }
     __syncthreads();
-    const int n = lane >> 1, half = lane & 1;
-    const int dr = drow(n_base + n);
     if (dr >= 0) {
         float4 v0 = *(const float4 *)(stg + n * 16 + half * 8), v1 = *(const float4 *)(stg + n * 16 + half * 8 + 4);
         if (lr.bs) {
@@ -146,9 +211,9 @@ __device__ __forceinline__ void mmb_store_tile(const v8f & acc, float * __restri
                 for (int i = 0; i < r; ++i) {
                     // lu is [rank, n_col] with the rank axis innermost (both the graph's scaled u and the dense
                     // kernel's buffer use that layout), so one rank row is a stride of 1 and the column a stride of r
-                    const float ui = lr.lu[(size_t) i + (size_t) r * dr];
+                    const float uval = ui[i];
 #pragma unroll
-                    for (int e = 0; e < 8; ++e) c[e] += ui * mmb_h2f(h[e * r + i]);
+                    for (int e = 0; e < 8; ++e) c[e] += uval * mmb_h2f(h[e * r + i]);
                 }
                 v0.x += lr.scale*c[0]; v0.y += lr.scale*c[1]; v0.z += lr.scale*c[2]; v0.w += lr.scale*c[3];
                 v1.x += lr.scale*c[4]; v1.y += lr.scale*c[5]; v1.z += lr.scale*c[6]; v1.w += lr.scale*c[7];
@@ -351,13 +416,31 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
         store_wm = (store_tid >> 5) % WAVES_M;
     }
 #endif
+    // The wmma correction needs two rank-specialised operands, but only *one* copy of this loop: keeping the
+    // epilogue itself rank-templated cost five copies of it in every one of the ~200 kernel instantiations, which
+    // is minutes of clang time on this file.
+    const bool wcorr = lr.lu != nullptr && lr.bs == nullptr && lr.eb != 0 && TM <= 2;
+    const int lrow = lane & 15;
 #pragma unroll
     for (int i = 0; i < TM; ++i) {
         const int ml = store_wm * WTM + i * 16; const bool ok = ml < a_rows;
+        v16s ac;
+        if constexpr (TM <= 2) { if (wcorr) { ac = mmb_lora_op_a_any(lr, m0 + ml + lrow, ml + lrow < a_rows); } }
 #pragma unroll
         for (int j = 0; j < TN; ++j) {
-            if (ok && jact[j]) mmb_store_tile(acc[i][j], stg, D, Dh, store_f32, M, drow, wn * WTN + j * 16, m0 + ml, lane, lr);
-            else { __syncthreads(); __syncthreads(); }
+            if (ok && jact[j]) {
+                if constexpr (TM <= 2) {
+                if (wcorr) {
+                    const v16s bc = mmb_lora_op_b_any(lr, drow(wn * WTN + j * 16 + lrow));
+                    const v8f corr = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(bc, ac, acc[i][j]);
+                    mmb_store_tile(corr, stg, D, Dh, store_f32, M, drow, wn * WTN + j * 16, m0 + ml, lane, mmb_lora_t{});
+                } else {
+                    mmb_store_tile(acc[i][j], stg, D, Dh, store_f32, M, drow, wn * WTN + j * 16, m0 + ml, lane, lr);
+                }
+                } else {
+                    mmb_store_tile(acc[i][j], stg, D, Dh, store_f32, M, drow, wn * WTN + j * 16, m0 + ml, lane, lr);
+                }
+            } else { __syncthreads(); __syncthreads(); }
         }
     }
 }
@@ -1497,7 +1580,7 @@ static void mmb_lora_bench(ggml_backend_cuda_context & ctx) {
     };
     const int R = 4, reps = 20;
     cudaStream_t stream = ctx.stream();
-    fprintf(stderr, "%-24s %9s %9s %7s | %9s %9s %7s\n", "M,K,T", "128 plain", "128 lora", "delta", "256 plain", "256 lora", "delta");
+    fprintf(stderr, "%-24s %9s %9s %7s %9s %7s | %9s %9s %7s\n", "M,K,T", "128 plain", "128 sc", "delta", "128 wmma", "delta", "256 plain", "256 lora", "delta");
     for (const auto & sh : shapes) {
         ggml_cuda_pool_alloc<float>    d_x (ctx.pool(), (size_t) sh.K*sh.T);
         ggml_cuda_pool_alloc<float>    d_o (ctx.pool(), (size_t) sh.M*sh.T);
@@ -1510,17 +1593,22 @@ static void mmb_lora_bench(ggml_backend_cuda_context & ctx) {
         cudaMemsetAsync(d_w.ptr, 0, ggml_row_size(GGML_TYPE_IQ4_NL, sh.K)*sh.M, stream);
         cudaMemsetAsync(d_b.ptr, 0, sizeof(uint16_t)*(size_t)R*sh.M, stream);
         cudaMemsetAsync(d_xh.ptr, 0, sizeof(uint16_t)*(size_t)sh.K*sh.T, stream);
-        const mmb_lora_t lr = { d_u.ptr, d_b.ptr, nullptr, 1.0f, R };
+        // eb != 0 marks the routed (per-expert) geometry, which is what enables the wmma epilogue; the bench only uses
+        // it as that flag, the offset itself is applied by the routed kernel
+        const mmb_lora_t lr_scalar = { d_u.ptr, d_b.ptr, nullptr, 1.0f, R, 0 };
+        const mmb_lora_t lr_wmma   = { d_u.ptr, d_b.ptr, nullptr, 1.0f, R, (size_t) R * sh.M * 2 };
         const dim3 gs((sh.M + 127) / 128, (sh.T + 127) / 128);
         const dim3 gb((sh.M + 127) / 128, (sh.T + 255) / 256);
-        float ms[4];
-        for (int mode = 0; mode < 4; ++mode) {
-            const bool wide = mode >= 2, corr = (mode & 1);
+        const mmb_lora_t * modearg[6] = { nullptr, &lr_scalar, &lr_wmma, nullptr, &lr_scalar, &lr_wmma };
+        float ms[6];
+        for (int mode = 0; mode < 6; ++mode) {
+            const bool wide = mode >= 3;
+            const mmb_lora_t * pl = modearg[mode];
             auto run = [&]() {
                 if (wide) mmb_dense_lora_kernel<128, 256, 64, 64, 32 + GGML_TYPE_IQ4_NL><<<gb, MMB_NT, 0, stream>>>(
-                        d_w.ptr, d_xh.ptr, d_o.ptr, sh.M, sh.K, sh.T, corr ? lr : mmb_lora_t{});
+                        d_w.ptr, d_xh.ptr, d_o.ptr, sh.M, sh.K, sh.T, pl ? *pl : mmb_lora_t{});
                 else      mmb_dense_lora_kernel<128, 128, 32, 64, 32 + GGML_TYPE_IQ4_NL><<<gs, MMB_NT, 0, stream>>>(
-                        d_w.ptr, d_xh.ptr, d_o.ptr, sh.M, sh.K, sh.T, corr ? lr : mmb_lora_t{});
+                        d_w.ptr, d_xh.ptr, d_o.ptr, sh.M, sh.K, sh.T, pl ? *pl : mmb_lora_t{});
             };
             for (int i = 0; i < 3; ++i) run();
             CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -1529,8 +1617,9 @@ static void mmb_lora_bench(ggml_backend_cuda_context & ctx) {
             CUDA_CHECK(cudaStreamSynchronize(stream));
             ms[mode] = (float) (ggml_time_us() - t0) / 1000.0f / reps;
         }
-        fprintf(stderr, "M=%-5d K=%-5d T=%-5d %9.3f %9.3f %6.1f%% | %9.3f %9.3f %6.1f%%\n", sh.M, sh.K, sh.T,
-                ms[0], ms[1], 100.0*(ms[1]-ms[0])/ms[0], ms[2], ms[3], 100.0*(ms[3]-ms[2])/ms[2]);
+        fprintf(stderr, "M=%-5d K=%-5d T=%-5d %9.3f %9.3f %6.1f%% %9.3f %6.1f%% | %9.3f %9.3f %6.1f%%\n", sh.M, sh.K, sh.T,
+                ms[0], ms[1], 100.0*(ms[1]-ms[0])/ms[0], ms[2], 100.0*(ms[2]-ms[0])/ms[0],
+                ms[3], ms[4], 100.0*(ms[4]-ms[3])/ms[3]);
     }
 }
 
