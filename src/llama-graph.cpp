@@ -1715,13 +1715,28 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         const float adapter_scale = lora.second;
         const float scale = lw->get_scale(lora.first->alpha, adapter_scale);
 
-        ggml_tensor * ab_cur = ggml_mul_mat(
-                ctx0, lw->b,
-                ggml_mul_mat(ctx0, lw->a, cur)
-                );
+        // a prefill-sized batch runs the whole chain as one fused op: the two matmuls, the scale
+        // and the add, so x, res and the output are each touched once instead of the
+        // [n_embd_out, n_tokens] product being written and re-read by a scale and an add
+        const int64_t n_rank = lw->a->ne[1];
 
-        ab_cur = ggml_scale(ctx0, ab_cur, scale);
-        res = ggml_add(ctx0, res, ab_cur);
+        if (cur->ne[1] >= 256 && n_rank >= 1 && n_rank <= 8 &&
+            lw->a->type == GGML_TYPE_F16 && lw->b->type == GGML_TYPE_F16 &&
+            lw->b->ne[0] == n_rank && lw->a->ne[0] == cur->ne[0] && lw->b->ne[1] == res->ne[0] &&
+            cur->type == GGML_TYPE_F32 && res->type == GGML_TYPE_F32 &&
+            cur->ne[2] == 1 && cur->ne[3] == 1 && res->ne[2] == 1 && res->ne[3] == 1 &&
+            ggml_is_contiguous(cur) && ggml_is_contiguous(res)) {
+            res = ggml_mul_mat_lora(ctx0, lw->a, lw->b, cur, res, scale);
+            continue;
+        }
+
+        // scale the rank-sized intermediate rather than the [n_embd_out, n_tokens] product:
+        // scale*(B@u) == B@(scale*u), and u has n_rank rows instead of n_embd_out, so the scale
+        // no longer walks a full activation-sized tensor once per weight
+        ggml_tensor * u = ggml_mul_mat(ctx0, lw->a, cur);
+
+        u = ggml_scale(ctx0, u, scale);
+        res = ggml_add(ctx0, res, ggml_mul_mat(ctx0, lw->b, u));
     }
 
     return res;
@@ -1734,6 +1749,20 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w_s,
           ggml_tensor * slots) const {
     cur = build_hadamard_input(w, cur);
+    // the scaled LoRA intermediates are built before the product so the routed matmul can fold their correction
+    // into its own epilogue (docs_gfx1151/lora_mmb_fusion_plan.md); u does not depend on res, so the order is free
+    std::vector<ggml_tensor *> lora_u;
+    for (const auto & lora : *loras) {
+        llama_adapter_lora_weight * lw = lora.first->get_weight(w);
+        if (lw == nullptr) {
+            continue;
+        }
+        const float alpha = lora.first->alpha;
+        const float rank  = (float) lw->b->ne[0];
+        const float scale = alpha ? lora.second * alpha / rank : lora.second;
+        // see build_lora_mm(): scale the rank-sized intermediate, not the product
+        lora_u.push_back(ggml_scale(ctx0, ggml_mul_mat_id(ctx0, lw->a, cur, ids), scale));
+    }
     // the experts in the MoE cache are selected by their slots
     ggml_tensor * res = slots == nullptr ?
         ggml_mul_mat_id(ctx0, w, cur, ids) :
@@ -1747,6 +1776,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         ggml_prec_set_acc(res, GGML_PREC_BF16);
     }
 
+    int i_lora = 0;
     if (w_s) {
         const int64_t n_expert = w_s->ne[0];
         const int64_t n_tokens = cur->ne[2];
@@ -1761,18 +1791,10 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
             continue;
         }
 
-        const float alpha = lora.first->alpha;
-        const float rank  = (float) lw->b->ne[0];
-        const float scale = alpha ? lora.second * alpha / rank : lora.second;
-
-        ggml_tensor * ab_cur = ggml_mul_mat_id(
-                ctx0, lw->b,
-                ggml_mul_mat_id(ctx0, lw->a, cur, ids),
-                ids
-                );
-
-        ab_cur = ggml_scale(ctx0, ab_cur, scale);
-        res = ggml_add(ctx0, res, ab_cur);
+        // the LoRA term first: the graph is emitted depth-first from its output, so this is what puts the correction
+        // chain (u, scale, b) ahead of the product the fused routed matmul replaces. add is commutative in IEEE
+        // arithmetic, so the result is bit-identical either way.
+        res = ggml_add(ctx0, ggml_mul_mat_id(ctx0, lw->b, lora_u[i_lora++], ids), res);
     }
 
     return res;
@@ -2686,10 +2708,12 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
             const float adapter_scale = lora.second;
             const float scale = lw->get_scale(lora.first->alpha, adapter_scale);
 
-            ggml_tensor * inpL_delta = ggml_scale(ctx0, ggml_mul_mat(
+            // scale the rank-sized lookup result rather than the [n_embd, n_tokens] product
+            ggml_tensor * u = ggml_get_rows(ctx0, lw->a, ids);
+
+            ggml_tensor * inpL_delta = ggml_mul_mat(
                         ctx0, lw->b, // non-transposed lora_b
-                        ggml_get_rows(ctx0, lw->a, ids)
-                        ), scale);
+                        ggml_scale(ctx0, u, scale));
 
             cur = ggml_add(ctx0, cur, inpL_delta);
         }

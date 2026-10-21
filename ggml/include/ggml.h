@@ -570,6 +570,7 @@ extern "C" {
 
         GGML_OP_MUL_MAT,
         GGML_OP_MUL_MAT_ID,
+        GGML_OP_MUL_MAT_LORA,
         GGML_OP_OUT_PROD,
 
         GGML_OP_SCALE,
@@ -1554,6 +1555,17 @@ extern "C" {
             struct ggml_tensor  * as,
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
+
+    // out = base + scale * b @ (a @ x), for a LoRA adapter: a is [K, rank] F16, b is [rank, M] F16,
+    // x and base are [K, N] / [M, N] F32 and the result is [M, N] F32. Fuses the two matmuls, the
+    // scale and the add into one pass over x, base and out instead of six over the [M, N] product
+    GGML_API struct ggml_tensor * ggml_mul_mat_lora(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * base,
+            float                 scale);
 
     // A: m columns, n rows,
     // B: p columns, n rows,

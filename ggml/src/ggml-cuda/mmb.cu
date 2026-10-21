@@ -4,6 +4,7 @@
 #include <map>
 #include <utility>
 #include "mmid.cuh"
+#include "lora.cuh"
 #include <cstdlib>
 #include <vector>
 #include <unordered_set>
@@ -95,9 +96,20 @@ __device__ __forceinline__ void mmb_dq_row68(const uint4 w0, const uint4 w1, con
     }
 }
 
+// LoRA correction applied inside the MMB epilogue: out += scale * lora_b @ u, with u = lora_a @ x
+// precomputed once per weight ([rank, n_tok] F32). Empty (lu == nullptr) means no correction.
+struct mmb_lora_t {
+    const float    * lu;    // [rank, n_col] F32, rank axis innermost: element (i, col) at i + rank*col
+    const uint16_t * lb;    // lora_b F16 bits, element (i, m) at lb[i + m*rank] of the expert's slice
+    const float    * bs;    // per-column factor the graph applies to the product before the add (w_s), or null
+    float scale;
+    int   rank;
+    size_t eb;              // per-expert stride of lb in bytes (0 for a dense weight)
+};
+
 template <typename DRowFn>
 __device__ __forceinline__ void mmb_store_tile(const v8f & acc, float * __restrict__ stg, float * __restrict__ D, uint16_t * __restrict__ Dh,
-        const bool store_f32, const int M, DRowFn drow, const int n_base, const int m_base, const int lane) {
+        const bool store_f32, const int M, DRowFn drow, const int n_base, const int m_base, const int lane, const mmb_lora_t & lr) {
     const int cm = lane & 15, cn = lane >> 4;
 #pragma unroll
     for (int e = 0; e < 8; ++e) { stg[(2 * e + cn) * 16 + cm] = acc[e]; }
@@ -105,7 +117,50 @@ __device__ __forceinline__ void mmb_store_tile(const v8f & acc, float * __restri
     const int n = lane >> 1, half = lane & 1;
     const int dr = drow(n_base + n);
     if (dr >= 0) {
-        const float4 v0 = *(const float4 *)(stg + n * 16 + half * 8), v1 = *(const float4 *)(stg + n * 16 + half * 8 + 4);
+        float4 v0 = *(const float4 *)(stg + n * 16 + half * 8), v1 = *(const float4 *)(stg + n * 16 + half * 8 + 4);
+        if (lr.bs) {
+            // the graph multiplies the product by a per-(slot, token) factor before adding the correction; doing it
+            // here is the same F32 multiply on the same values, so the result stays bit-identical
+            const float f = lr.bs[dr];
+            v0.x *= f; v0.y *= f; v0.z *= f; v0.w *= f;
+            v1.x *= f; v1.y *= f; v1.z *= f; v1.w *= f;
+        }
+        if (lr.lu) {
+            // this lane owns eight consecutive output rows of one token. The u column is the token index, which
+            // is what drow() returns for the store (dr); n_base is only the in-tile column. lora_b is [rank, M] in
+            // ggml, so (i, m) sits at i + m*rank: the eight rows and all ranks are one contiguous span of
+            // 8*rank halves (rank is even, so whole 16-byte reads).
+            // R is a template constant below: with a runtime rank the staging array is indexed dynamically, the
+            // compiler moves it to scratch memory, and the correction then costs ~40x what its FMAs cost.
+            auto corr = [&](auto RC) {
+                constexpr int r  = decltype(RC)::value;
+                constexpr int NH = (8 * r * 2 + 15) / 16;
+                const int mrow = m_base + half * 8;
+                uint4 hv[NH];
+                const char * hsrc = (const char *) (lr.lb + (size_t) mrow * r);
+#pragma unroll
+                for (int t = 0; t < NH; ++t) hv[t] = *(const uint4 *) (hsrc + 16 * t);
+                const uint16_t * h = (const uint16_t *) hv;
+                float c[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+                for (int i = 0; i < r; ++i) {
+                    // lu is [rank, n_col] with the rank axis innermost (both the graph's scaled u and the dense
+                    // kernel's buffer use that layout), so one rank row is a stride of 1 and the column a stride of r
+                    const float ui = lr.lu[(size_t) i + (size_t) r * dr];
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) c[e] += ui * mmb_h2f(h[e * r + i]);
+                }
+                v0.x += lr.scale*c[0]; v0.y += lr.scale*c[1]; v0.z += lr.scale*c[2]; v0.w += lr.scale*c[3];
+                v1.x += lr.scale*c[4]; v1.y += lr.scale*c[5]; v1.z += lr.scale*c[6]; v1.w += lr.scale*c[7];
+            };
+            switch (lr.rank) {   // the fused entry only admits even ranks in [2, 8]
+                case 2: corr(std::integral_constant<int, 2>{}); break;
+                case 4: corr(std::integral_constant<int, 4>{}); break;
+                case 6: corr(std::integral_constant<int, 6>{}); break;
+                case 8: corr(std::integral_constant<int, 8>{}); break;
+                default: break;
+            }
+        }
         const size_t base = (size_t)dr * M + m_base + half * 8;
         const bool full = m_base + 16 <= M;
         if (store_f32) {
@@ -126,7 +181,7 @@ __device__ __forceinline__ void mmb_store_tile(const v8f & acc, float * __restri
 template <int BM, int BN, int WTM, int WTN, int WTYPE, bool TAIL, typename XRowFn, typename DRowFn>
 __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase, const size_t wrow_bytes, const int a_rows,
         const uint16_t * __restrict__ Xh, const int K, XRowFn xrow, float * __restrict__ D, uint16_t * __restrict__ Dh, const bool store_f32, const int M, DRowFn drow, const int m0,
-        const int n_cols, uint16_t * As, uint16_t * Bs) {
+        const int n_cols, uint16_t * As, uint16_t * Bs, const mmb_lora_t & lr) {
     constexpr int WAVES_M = BM / WTM, TM = WTM / 16, TN = WTN / 16;
     constexpr int A_ITEMS = (BM + MMB_NT - 1) / MMB_NT;
     constexpr int B_ITEMS = (BN * 8) / MMB_NT;
@@ -239,7 +294,7 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
         const int ml = wm * WTM + i * 16; const bool ok = ml < a_rows;
 #pragma unroll
         for (int j = 0; j < TN; ++j) {
-            if (ok && jact[j]) mmb_store_tile(acc[i][j], stg, D, Dh, store_f32, M, drow, wn * WTN + j * 16, m0 + ml, lane);
+            if (ok && jact[j]) mmb_store_tile(acc[i][j], stg, D, Dh, store_f32, M, drow, wn * WTN + j * 16, m0 + ml, lane, lr);
             else { __syncthreads(); __syncthreads(); }
         }
     }
@@ -256,7 +311,7 @@ mmb_dense_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__ X
     const int m0 = blockIdx.x * BM, t0 = blockIdx.y * BN;
     const size_t wrow_bytes = mmb_row_bytes<WTYPE>(K);
     mmb_tile_gemm<BM, BN, WTM, WTN, WTYPE, false>(W + (size_t)m0 * wrow_bytes, wrow_bytes, M - m0, Xh, K,
-        [&](int i) { return (t0 + i < T) ? t0 + i : -1; }, D, Dh, store_f32, M, [&](int i) { return (t0 + i < T) ? t0 + i : -1; }, m0, T - t0, As, Bs);
+        [&](int i) { return (t0 + i < T) ? t0 + i : -1; }, D, Dh, store_f32, M, [&](int i) { return (t0 + i < T) ? t0 + i : -1; }, m0, T - t0, As, Bs, mmb_lora_t{});
 #endif
 }
 
@@ -373,12 +428,33 @@ hc_gate_mix_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__
 #endif
 }
 
+// same as mmb_dense_kernel, plus the LoRA correction in the epilogue. Launched only by
+// ggml_cuda_mul_mat_mmb_lora(), which owns the geometry, so no other launch site can pass an empty
+// descriptor by accident.
+template <int BM, int BN, int WTM, int WTN, int WTYPE>
+__global__ void __launch_bounds__(MMB_NT, 2)
+mmb_dense_lora_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__ Xh, float * __restrict__ D,
+        const int M, const int K, const int T, const mmb_lora_t lr) {
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(RDNA3)
+    NO_DEVICE_CODE; // WMMA kernels are RDNA3-only; the host gate keeps other devices off this path
+#else
+    __shared__ __align__(16) uint16_t As[BM * MMB_LDS_STRIDE];
+    __shared__ __align__(16) uint16_t Bs[BN * MMB_LDS_STRIDE];
+    const int m0 = blockIdx.x * BM, t0 = blockIdx.y * BN;
+    const size_t wrow_bytes = mmb_row_bytes<WTYPE>(K);
+    mmb_tile_gemm<BM, BN, WTM, WTN, WTYPE, false>(W + (size_t)m0 * wrow_bytes, wrow_bytes, M - m0, Xh, K,
+        [&](int i) { return (t0 + i < T) ? t0 + i : -1; }, D, (uint16_t *) nullptr, true, M,
+        [&](int i) { return (t0 + i < T) ? t0 + i : -1; }, m0, T - t0, As, Bs, lr);
+#endif
+}
+
 template <int BM, int BN, int WTM, int WTN, int WTYPE = 0>
 __global__ void __launch_bounds__(MMB_NT, 2)
 mmb_routed_kernel(const uint8_t * __restrict__ W, const size_t expert_bytes, const uint16_t * __restrict__ Xh, float * __restrict__ D,
         uint16_t * __restrict__ Dh, const bool store_f32,
         const int32_t * __restrict__ ids_src, const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ bounds,
-        const uint32_t * __restrict__ desc, const int M, const int K) {
+        const uint32_t * __restrict__ desc, const int M, const int K, const mmb_lora_t lr) {   // by value: a
+        // reference parameter reaches the device as a pointer into the host stack and faults on first read
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(RDNA3)
     NO_DEVICE_CODE; // WMMA kernels are RDNA3-only; the host gate keeps other devices off this path
 #else
@@ -390,8 +466,12 @@ mmb_routed_kernel(const uint8_t * __restrict__ W, const size_t expert_bytes, con
     const int r0 = bounds[e] + jt * BN, cnt = bounds[e + 1] - r0;
     const int m0 = blockIdx.x * BM;
     const size_t wrow_bytes = mmb_row_bytes<WTYPE>(K);
+    // the factors are per expert; the correction column is drow(i) = slot + n_used*token, which is exactly the
+    // column of u = mul_mat_id(lora_a, x, ids), so lora_b only has to move to this block's expert
+    mmb_lora_t lre = lr;
+    if (lr.lb) lre.lb = (const uint16_t *) ((const char *) lr.lb + (size_t) e * lr.eb);
     mmb_tile_gemm<BM, BN, WTM, WTN, WTYPE, true>(W + (size_t)e * expert_bytes + (size_t)m0 * wrow_bytes, wrow_bytes, M - m0, Xh, K,
-        [&](int i) { return (i < cnt) ? ids_src[r0 + i] : -1; }, D, Dh, store_f32, M, [&](int i) { return (i < cnt) ? ids_dst[r0 + i] : -1; }, m0, cnt, As, Bs);
+        [&](int i) { return (i < cnt) ? ids_src[r0 + i] : -1; }, D, Dh, store_f32, M, [&](int i) { return (i < cnt) ? ids_dst[r0 + i] : -1; }, m0, cnt, As, Bs, lre);
 #endif
 }
 
@@ -541,7 +621,7 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
                 v8f v;
 #pragma unroll
                 for (int e = 0; e < 8; ++e) { v[e] = ggml_cuda_op_silu_single(accg[i][j][e]) * accu[i][j][e]; }
-                mmb_store_tile(v, stg, D, Dh, store_f32, M, drow, wn * WTN + j * 16, m0 + ml, lane);
+                mmb_store_tile(v, stg, D, Dh, store_f32, M, drow, wn * WTN + j * 16, m0 + ml, lane, mmb_lora_t{});
             } else { __syncthreads(); __syncthreads(); }
         }
     }
@@ -1296,6 +1376,98 @@ bool ggml_cuda_mmb_f32_dual(ggml_backend_cuda_context & ctx, const ggml_tensor *
     return true;
 }
 
+// one-shot kernel microbenchmark for the fused epilogue (GGML_CUDA_LORA_FUSE_BENCH=1): the same launch with
+// and without the correction, for both tile geometries, at the shapes the dense adapters target
+static void mmb_lora_bench(ggml_backend_cuda_context & ctx) {
+    struct shape { int K, M, T; };
+    static const shape shapes[] = {
+        {2560, 10240, 8192}, {2560, 12288, 8192}, {2560, 6144, 8192},
+        {6144,  2560, 8192}, {2560,   640, 8192}, { 640,  2560, 8192}, {2560, 512, 8192},
+    };
+    const int R = 4, reps = 20;
+    cudaStream_t stream = ctx.stream();
+    fprintf(stderr, "%-24s %9s %9s %7s | %9s %9s %7s\n", "M,K,T", "128 plain", "128 lora", "delta", "256 plain", "256 lora", "delta");
+    for (const auto & sh : shapes) {
+        ggml_cuda_pool_alloc<float>    d_x (ctx.pool(), (size_t) sh.K*sh.T);
+        ggml_cuda_pool_alloc<float>    d_o (ctx.pool(), (size_t) sh.M*sh.T);
+        ggml_cuda_pool_alloc<float>    d_u (ctx.pool(), (size_t) R*sh.T);
+        ggml_cuda_pool_alloc<uint8_t>  d_w (ctx.pool(), (size_t) ggml_row_size(GGML_TYPE_IQ4_NL, sh.K)*sh.M);
+        ggml_cuda_pool_alloc<uint16_t> d_b (ctx.pool(), (size_t) R*sh.M);
+        ggml_cuda_pool_alloc<uint16_t> d_xh(ctx.pool(), (size_t) sh.K*sh.T);
+        if (!d_x.ptr || !d_o.ptr || !d_u.ptr || !d_w.ptr || !d_b.ptr || !d_xh.ptr) continue;
+        cudaMemsetAsync(d_x.ptr, 0, sizeof(float)*(size_t)sh.K*sh.T, stream);
+        cudaMemsetAsync(d_w.ptr, 0, ggml_row_size(GGML_TYPE_IQ4_NL, sh.K)*sh.M, stream);
+        cudaMemsetAsync(d_b.ptr, 0, sizeof(uint16_t)*(size_t)R*sh.M, stream);
+        cudaMemsetAsync(d_xh.ptr, 0, sizeof(uint16_t)*(size_t)sh.K*sh.T, stream);
+        const mmb_lora_t lr = { d_u.ptr, d_b.ptr, nullptr, 1.0f, R };
+        const dim3 gs((sh.M + 127) / 128, (sh.T + 127) / 128);
+        const dim3 gb((sh.M + 127) / 128, (sh.T + 255) / 256);
+        float ms[4];
+        for (int mode = 0; mode < 4; ++mode) {
+            const bool wide = mode >= 2, corr = (mode & 1);
+            auto run = [&]() {
+                if (wide) mmb_dense_lora_kernel<128, 256, 64, 64, 32 + GGML_TYPE_IQ4_NL><<<gb, MMB_NT, 0, stream>>>(
+                        d_w.ptr, d_xh.ptr, d_o.ptr, sh.M, sh.K, sh.T, corr ? lr : mmb_lora_t{});
+                else      mmb_dense_lora_kernel<128, 128, 32, 64, 32 + GGML_TYPE_IQ4_NL><<<gs, MMB_NT, 0, stream>>>(
+                        d_w.ptr, d_xh.ptr, d_o.ptr, sh.M, sh.K, sh.T, corr ? lr : mmb_lora_t{});
+            };
+            for (int i = 0; i < 3; ++i) run();
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            const int64_t t0 = ggml_time_us();
+            for (int i = 0; i < reps; ++i) run();
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            ms[mode] = (float) (ggml_time_us() - t0) / 1000.0f / reps;
+        }
+        fprintf(stderr, "M=%-5d K=%-5d T=%-5d %9.3f %9.3f %6.1f%% | %9.3f %9.3f %6.1f%%\n", sh.M, sh.K, sh.T,
+                ms[0], ms[1], 100.0*(ms[1]-ms[0])/ms[0], ms[2], ms[3], 100.0*(ms[3]-ms[2])/ms[2]);
+    }
+}
+
+// w @ x with the LoRA apply folded into the epilogue: dst = w @ x + scale * lora_b @ (lora_a @ x).
+// Returns false when the weight/shape is not one it wants to handle, and the caller falls back to the
+// matmul plus GGML_OP_MUL_MAT_LORA chain.
+bool ggml_cuda_mul_mat_mmb_lora(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * x,
+        const ggml_tensor * la, const ggml_tensor * lb, const float scale, ggml_tensor * dst) {
+    {
+        static const bool bench = getenv("GGML_CUDA_LORA_FUSE_BENCH") != nullptr;
+        static bool done = false;
+        if (bench && !done) { done = true; mmb_lora_bench(ctx); }
+    }
+    if (!mmb_quant_type_dense(w->type) || !ggml_cuda_mmb_supported_mm(ctx, w, x, dst)) return false;
+    if (la->type != GGML_TYPE_F16 || lb->type != GGML_TYPE_F16) return false;
+    if (!ggml_is_contiguous(la) || !ggml_is_contiguous(lb)) return false;
+    if (ggml_cuda_mmb_is_bf16_only(ctx, dst)) return false;   // the fused epilogue stores F32
+    const int K = (int) w->ne[0], M = (int) w->ne[1], T = (int) x->ne[1], R = (int) la->ne[1];
+    if (R < 2 || R > 8 || (R & 1) || la->ne[0] != K || lb->ne[0] != R || lb->ne[1] != M) return false;
+    if (K % MMB_BK != 0 || M % 16 != 0) return false;
+    cudaStream_t stream = ctx.stream();
+    const uint16_t * xhp = mmb_bf16_activation(ctx, x, (size_t) T*K, stream);
+    if (!xhp) return false;
+    // u = lora_a @ x, once per weight; the pool frees it back only after the next allocation on this stream
+    ggml_cuda_pool_alloc<float> lu(ctx.pool(), (size_t) R*T);
+    if (!lu.ptr) return false;
+    ggml_cuda_lora_u(la->data, (const float *) x->data, lu.ptr, K, T, R, stream);
+    // the same weight representation and the same tile geometry the unfused matmul would pick, so the base product
+    // stays bit-identical and the only difference left is the correction: the wide 128x256 tile is 27-38% faster
+    // than 128x128 on the big-M weights (kernel bench, gfx1151), which is exactly the margin the fusion has to beat
+    const uint16_t * shadow = ((w->type == GGML_TYPE_IQ4_NL && mmb_shadow()) || w->type == GGML_TYPE_Q6_K) ? mmb_shadow_lookup(ctx, w) : nullptr;
+    const bool big = (M >= 6144 && K >= 2560) || (shadow && K >= 2560 && T >= 4096);
+    const mmb_lora_t lr = { lu.ptr, (const uint16_t *) lb->data, nullptr, scale, R };
+    const dim3 grid((M + 127) / 128, big ? (T + 255) / 256 : (T + 127) / 128);
+    auto launch = [&](auto tag, const uint8_t * wp) {
+        constexpr int WT = decltype(tag)::value;
+        if (big) mmb_dense_lora_kernel<128, 256, 64, 64, WT><<<grid, MMB_NT, 0, stream>>>(wp, xhp, (float *) dst->data, M, K, T, lr);
+        else     mmb_dense_lora_kernel<128, 128, 32, 64, WT><<<grid, MMB_NT, 0, stream>>>(wp, xhp, (float *) dst->data, M, K, T, lr);
+    };
+    if (shadow) launch(std::integral_constant<int, 2>{}, (const uint8_t *) shadow);
+    else mmb_dispatch_quant(w->type, [&](auto tag) { launch(tag, (const uint8_t *) w->data); });
+    CUDA_CHECK(cudaGetLastError());
+    if (getenv("GGML_CUDA_LORA_FUSE_DEBUG")) {
+        fprintf(stderr, "mmb_lora: fused %s K=%d M=%d T=%d rank=%d shadow=%d\n", w->name, K, M, T, R, shadow != nullptr);
+    }
+    return true;
+}
+
 bool ggml_cuda_mmb_gatemix() { return mmb_gatemix_flag(); }
 bool ggml_cuda_mmb_down16() { return mmb_down16_flag(); }
 bool ggml_cuda_mmb_blk16() { return true; }
@@ -1329,7 +1501,9 @@ bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     return true;
 }
 
-void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+// routed expert matmul, optionally with the LoRA correction of every expert folded into the epilogue (lrp != nullptr)
+static void mmb_routed_run(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const mmb_lora_t * lrp) {
+    const mmb_lora_t lr = lrp ? *lrp : mmb_lora_t{};
     cudaStream_t stream = ctx.stream();
     const int K = (int) src0->ne[0], M = (int) src0->ne[1], E = (int) src0->ne[2];
     const int ne11 = (int) src1->ne[1], T = (int) src1->ne[2], n_used = (int) ids->ne[0];
@@ -1371,15 +1545,57 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
         constexpr int WT = decltype(tag)::value;
     if (RT == 1) {
         const dim3 gb((M + 63) / 64, nbig_max), gs((M + 63) / 64, nsmall_max);
-        mmb_routed_kernel<64, BN, 32, 32, WT><<<gb, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
-        mmb_routed_kernel<64, BN_SMALL, 16, 16, WT><<<gs, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
+        mmb_routed_kernel<64, BN, 32, 32, WT><<<gb, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K, lr);
+        mmb_routed_kernel<64, BN_SMALL, 16, 16, WT><<<gs, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K, lr);
     } else {
-    mmb_routed_kernel<128, BN, 32, 64, WT><<<gbig, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
-    mmb_routed_kernel<128, BN_SMALL, 16, 32, WT><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
+    mmb_routed_kernel<128, BN, 32, 64, WT><<<gbig, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K, lr);
+    mmb_routed_kernel<128, BN_SMALL, 16, 32, WT><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K, lr);
     }
     });
     CUDA_CHECK(cudaGetLastError());
 }
+
+void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+    mmb_routed_run(ctx, src0, src1, ids, dst, nullptr);
+}
+
+// MoE LoRA applied inside the routed expert matmul: dst = w @ x + scale * lora_b @ (lora_a @ x), summed over the
+// selected experts. u is built here, indexed by (slot, token) exactly like the expert product's columns, so the
+// epilogue only has to move lora_b to the block's expert. Replaces five graph nodes, see
+// docs_gfx1151/lora_mmb_fusion_plan.md.
+#define LORA_ID_FAIL(why) do { \
+    static const bool dbg = getenv("GGML_CUDA_LORA_FUSE_DEBUG") != nullptr; \
+    if (dbg) { fprintf(stderr, "moe-skip %s: %s\n", w->name, why); } \
+    return false; \
+} while (0)
+bool ggml_cuda_mul_mat_id_mmb_lora(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * x, const ggml_tensor * ids,
+        const ggml_tensor * lu, const ggml_tensor * lb, const ggml_tensor * xscale, ggml_tensor * dst) {
+    if (!ggml_cuda_mmb_supported_mmid(ctx, w, x, ids, dst)) LORA_ID_FAIL("supported_mmid");
+    if (lb->type != GGML_TYPE_F16 || !ggml_is_contiguous(lb)) LORA_ID_FAIL("lb type/contig");
+    if (ggml_cuda_mmb_is_bf16_only(ctx, dst)) LORA_ID_FAIL("bf16_only dst");   // the fused epilogue stores F32
+    const int K = (int) w->ne[0], M = (int) w->ne[1], E = (int) w->ne[2];
+    const int R = (int) lb->ne[0], n_used = (int) ids->ne[0], T = (int) x->ne[2];
+    if (R < 2 || R > 8 || (R & 1)) LORA_ID_FAIL("rank");
+    if (lu->type != GGML_TYPE_F32 || lu->ne[0] != R || lu->ne[1] != n_used || lu->ne[2] != T) LORA_ID_FAIL("lu shape");
+    if (lb->ne[1] != M || lb->ne[2] != E) LORA_ID_FAIL("lb shape");
+    // x is [K, 1, T], or [K, n_used, T] when every used expert carries its own activation (the down projection's
+    // per-slot SwiGLU output). The routed kernel gathers both the same way, and u's column is the same (slot, token)
+    // column the store uses, so nothing else changes.
+    if ((x->ne[1] != 1 && x->ne[1] != n_used) || K % MMB_BK != 0 || M % 16 != 0) LORA_ID_FAIL("x/K/M");
+    if (xscale && (xscale->type != GGML_TYPE_F32 || !ggml_is_contiguous(xscale) || xscale->ne[0] != 1 ||
+                xscale->ne[1] != n_used || xscale->ne[2] != T)) LORA_ID_FAIL("xscale shape");
+    cudaStream_t stream = ctx.stream();
+    // lu already carries the adapter scale, so the epilogue's factor is 1
+    const mmb_lora_t lr = { (const float *) lu->data, (const uint16_t *) lb->data, xscale ? (const float *) xscale->data : nullptr,
+            1.0f, R, (size_t) R * M * 2 };
+    mmb_routed_run(ctx, w, x, ids, dst, &lr);
+    if (getenv("GGML_CUDA_LORA_FUSE_DEBUG")) {
+        fprintf(stderr, "mmb_lora: fused-id %s K=%d M=%d T=%d rank=%d E=%d used=%d w_s=%d\n",
+                w->name, K, M, T, R, E, n_used, xscale != nullptr);
+    }
+    return true;
+}
+#undef LORA_ID_FAIL
 
 bool ggml_cuda_mmb_supported_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * glu) {
     if (!mmb_enabled(ctx) || !mmb_glu() || !gw || !uw || !src1 || !ids || !glu) return false;

@@ -1795,6 +1795,60 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
     return ptr;
 }
 
+// out = base + scale * b @ (a @ x), the reference the CUDA fused kernel reproduces
+static void ggml_compute_forward_mul_mat_lora(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * a    = dst->src[0];
+    const struct ggml_tensor * b    = dst->src[1];
+    const struct ggml_tensor * x    = dst->src[2];
+    const struct ggml_tensor * base = dst->src[3];
+
+    const int64_t K = a->ne[0];
+    const int64_t R = a->ne[1];
+    const int64_t M = b->ne[1];
+    const int64_t N = x->ne[1];
+
+    const float scale = ggml_get_op_params_f32(dst, 0);
+
+    const size_t nb_a0 = a->nb[0], nb_a1 = a->nb[1];
+    const size_t nb_b0 = b->nb[0], nb_b1 = b->nb[1];
+    const size_t nb_x0 = x->nb[0], nb_x1 = x->nb[1];
+    const size_t nb_s0 = base->nb[0], nb_s1 = base->nb[1];
+    const size_t nb_d0 = dst->nb[0],  nb_d1 = dst->nb[1];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    float * u = (float *) malloc((size_t) R * sizeof(float));
+    GGML_ASSERT(u != NULL);
+
+    for (int64_t n = ith; n < N; n += nth) {
+        const char * xcol = (const char *) x->data + n*nb_x1;
+
+        for (int64_t r = 0; r < R; ++r) {
+            float acc = 0.0f;
+            for (int64_t k = 0; k < K; ++k) {
+                acc += ggml_fp16_to_fp32(*(const ggml_fp16_t *) ((const char *) a->data + r*nb_a1 + k*nb_a0)) *
+                       *(const float *) (xcol + k*nb_x0);
+            }
+            u[r] = acc;
+        }
+
+        for (int64_t m = 0; m < M; ++m) {
+            float s = 0.0f;
+            for (int64_t r = 0; r < R; ++r) {
+                s += ggml_fp16_to_fp32(*(const ggml_fp16_t *) ((const char *) b->data + r*nb_b0 + m*nb_b1)) * u[r];
+            }
+            *(float *) ((char *) dst->data + m*nb_d0 + n*nb_d1) =
+                *(const float *) ((const char *) base->data + m*nb_s0 + n*nb_s1) + scale*s;
+        }
+    }
+
+    free(u);
+}
+
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -2113,6 +2167,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_MUL_MAT_ID:
             {
                 ggml_compute_forward_mul_mat_id(params, tensor);
+            } break;
+        case GGML_OP_MUL_MAT_LORA:
+            {
+                ggml_compute_forward_mul_mat_lora(params, tensor);
             } break;
         case GGML_OP_OUT_PROD:
             {
@@ -2603,6 +2661,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CONCAT:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_MUL_MAT_LORA:
         case GGML_OP_OUT_PROD:
         case GGML_OP_SET_ROWS:
             {
@@ -3133,6 +3192,10 @@ struct ggml_cplan ggml_graph_plan(
                         // Workspace for tiled (see tiled.h)
                         cur = GGML_PAD(cur, 64);
                         cur += ggml_tiled_wdata_size(n_tasks, node);
+                    } break;
+                case GGML_OP_MUL_MAT_LORA:
+                    {
+                        cur = 0;
                     } break;
                 case GGML_OP_MUL_MAT_ID:
                     {
