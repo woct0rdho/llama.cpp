@@ -22,3 +22,7 @@ void ggml_cuda_mul_mat_lora_apply(ggml_backend_cuda_context & ctx, ggml_tensor *
 
 // u[rank, n_tok] = lora_a @ x, consumed by the fused MMB epilogue (ggml_cuda_mul_mat_mmb_lora)
 void ggml_cuda_lora_u(const void * la, const float * x, float * u, int64_t n_k, int64_t n_tok, int n_rank, cudaStream_t stream);
+// same for an expert weight, all n_used slots of a token in one pass over x
+void ggml_cuda_lora_u_id(const void * la, const float * x, const void * ids, const int64_t si1, float * u,
+        const int64_t n_k, const int64_t n_tok, const int n_used, const int nch, const int n_rank, const int64_t la_expert,
+        const float scale, cudaStream_t stream);
