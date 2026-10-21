@@ -570,6 +570,26 @@ static void mmb_dispatch_quant(ggml_type type, Fn fn) {
     }
 }
 
+// The dense LoRA epilogue and the hyper-connection kernels are only ever handed a Q8_0, an IQ4_NL or a trellis
+// weight (the bf16 shadow is passed as WTYPE 2 and never reaches this dispatch). Naming that set keeps ~20 quant
+// types worth of heavy WMMA instantiations out of the translation unit, which is most of this file's compile time.
+template <typename Fn>
+static void mmb_dispatch_dense(ggml_type type, Fn fn) {
+    switch (type) {
+        case GGML_TYPE_Q8_0:   fn(std::integral_constant<int, 1>{}); break;
+        case GGML_TYPE_IQ4_NL: fn(std::integral_constant<int, 0>{}); break;
+#ifdef GGML_USE_TRELLIS
+        case GGML_TYPE_TQ2_T: fn(std::integral_constant<int, 32 + GGML_TYPE_TQ2_T>{}); break;
+        case GGML_TYPE_TQK6:  fn(std::integral_constant<int, 32 + GGML_TYPE_TQK6>{}); break;
+        case GGML_TYPE_TQK7:  fn(std::integral_constant<int, 32 + GGML_TYPE_TQK7>{}); break;
+        case GGML_TYPE_TQP5:  fn(std::integral_constant<int, 32 + GGML_TYPE_TQP5>{}); break;
+        case GGML_TYPE_TQP6:  fn(std::integral_constant<int, 32 + GGML_TYPE_TQP6>{}); break;
+        case GGML_TYPE_TQP7:  fn(std::integral_constant<int, 32 + GGML_TYPE_TQP7>{}); break;
+#endif
+        default: GGML_ABORT("not a dense MMB quant type");
+    }
+}
+
 template <bool HALF = false>
 __device__ __forceinline__ void mmb_dq_q4k_slice(uint4 q0, uint4 q1, uint4 meta, int slice, uint32_t * out, int half = 0) {
     const float d = mmb_h2f((uint16_t) meta.x), dm = mmb_h2f((uint16_t)(meta.x >> 16));
