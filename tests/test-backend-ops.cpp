@@ -17781,6 +17781,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                             int k = 256;
                             test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, n_mats, n_used, b, m, n, k));
                         }
+                    }
+                }
+            }
+        }
+    }
+
     // MMQ tile-boundary cases. The MMQ J config is picked from n, and a wave-partitioning error in
     // one J tile only shows up when n sits on that tile's boundary: the neighbouring n selects a
     // different J and passes, which hides it. The general cases above stop at 129 and the MUL_MAT
@@ -17796,13 +17802,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t k : {160, 224, 288}) {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 256, 128, k, {1, 1}, {1, 1}));
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 2, false, 256, 128, k));
-        }
-    }
-
-
-                    }
-                }
-            }
         }
     }
 
