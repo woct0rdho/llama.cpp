@@ -409,6 +409,7 @@ if __name__ == '__main__':
 
         class LoraModel(model_class):  # ty: ignore[unsupported-base]
             model_arch = model_class.model_arch
+            is_adapter = True
 
             lora_alpha: float
 

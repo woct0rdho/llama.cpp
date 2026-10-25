@@ -98,6 +98,9 @@ class ModelBase:
     model_name: str | None
     metadata_override: Path | None
     metadata: gguf.Metadata
+    # adapters carry no model metadata: llama.cpp reads only general.type, adapter.* and the
+    # quantization version from them (the architecture comes from the base model's file)
+    is_adapter: bool = False
     dir_model_card: Path
     remote_hf_model_id: str | None
     target_model_dir: Path | None
@@ -1377,8 +1380,9 @@ class ModelBase:
 
         self.set_type()
 
-        logger.info("Set meta model")
-        self.metadata.set_gguf_meta_model(self.gguf_writer)
+        if not self.is_adapter:
+            logger.info("Set meta model")
+            self.metadata.set_gguf_meta_model(self.gguf_writer)
 
         logger.info("Set model parameters")
         self.set_gguf_parameters()
